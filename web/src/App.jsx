@@ -77,7 +77,6 @@ function Card({ v, progress }) {
         <small>
           {fmtSize(v.size)}
           {v.subs.length > 0 && ' · CC'}
-          {v.play !== 'yes' && <em className={v.play}>{v.play === 'no' ? ' · не играет' : ' · может не играть'}</em>}
         </small>
       </div>
     </a>
@@ -130,39 +129,175 @@ function Library({ videos, onRefresh, onLogout }) {
   );
 }
 
+const MODE_LABEL = {
+  direct: 'оригинал',
+  remux: 'перепаковка',
+  audio: 'перекодирование звука',
+  video: 'перекодирование видео',
+};
+
+// remember chosen audio/subtitle language so the next episode picks the same
+const PREFS_KEY = 'cinema.prefs';
+const loadPrefs = () => {
+  try { return JSON.parse(localStorage.getItem(PREFS_KEY)) || {}; } catch { return {}; }
+};
+const savePrefs = (patch) => {
+  try { localStorage.setItem(PREFS_KEY, JSON.stringify({ ...loadPrefs(), ...patch })); } catch {}
+};
+const pickByPref = (items, pref) => {
+  if (!pref) return -1;
+  let i = items.findIndex((x) => x.title && x.title === pref.title && x.lang === pref.lang);
+  if (i < 0 && pref.lang) i = items.findIndex((x) => x.lang === pref.lang);
+  return i;
+};
+
+const audioLabel = (a) =>
+  [a.lang && a.lang.toUpperCase(), a.title, a.codec, a.channels ? a.channels + 'ch' : ''].filter(Boolean).join(' · ');
+
 function Player({ v, list }) {
   const ref = useRef(null);
+  const wrap = useRef(null);
+  const [info, setInfo] = useState(null);
   const [error, setError] = useState('');
+  const [audio, setAudio] = useState(0);
+  const [sub, setSub] = useState('off');
+  const [offset, setOffset] = useState(0); // where the current ffmpeg stream starts
+  const [cur, setCur] = useState(0);
+  const [paused, setPaused] = useState(true);
+  const [seekVal, setSeekVal] = useState(null);
+  const [waiting, setWaiting] = useState(false);
+  const seekTimer = useRef(null);
+
   const idx = list.findIndex((x) => x.id === v.id);
   const next = idx >= 0 && list[idx + 1] && list[idx + 1].folder === v.folder ? list[idx + 1] : null;
 
+  // 1. find out what is inside the file
+  useEffect(() => {
+    let cancelled = false;
+    setInfo(null); setError(''); setCur(0);
+    api(`/api/probe/${v.id}`)
+      .then((i) => {
+        if (cancelled) return;
+        const prefs = loadPrefs();
+        let a = pickByPref(i.audio, prefs.audio);
+        if (a < 0) a = Math.max(0, i.audio.findIndex((x) => x.default));
+        setAudio(a);
+        const subs = [
+          ...v.subs.map((s) => ({ key: 'ext:' + s.id, lang: s.lang, title: s.label })),
+          ...i.subs.map((s) => ({ key: 'emb:' + s.index, lang: s.lang, title: s.title })),
+        ];
+        const si = prefs.sub === 'off' ? -1 : pickByPref(subs, prefs.sub);
+        setSub(si >= 0 ? subs[si].key : 'off');
+        const saved = loadProgress()[v.id];
+        setOffset(saved && saved.t > 5 ? saved.t - 3 : 0);
+        setInfo(i);
+      })
+      .catch((e) => !cancelled && setError(e.message));
+    return () => { cancelled = true; };
+  }, [v.id]);
+
+  const mode = info ? info.modes[audio] || info.modes[0] : null;
+  const streamMode = !!mode && mode !== 'direct';
+  const duration = info?.duration || 0;
+  const pos = streamMode ? offset + cur : cur;
+  const subOffset = streamMode ? offset : 0;
+
+  const src = !info ? null : streamMode
+    ? `/api/transcode/${v.id}?start=${offset.toFixed(1)}&audio=${audio}`
+    : `/api/stream/${v.id}`;
+
+  const posRef = useRef(0);
+  posRef.current = pos;
+
+  // 2. wire up the <video> element for the current source
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || !src) return;
+    setError('');
+    let last = 0;
+    const onMeta = () => { if (!streamMode && offset > 0) el.currentTime = offset; };
+    const onTime = () => {
+      setCur(el.currentTime);
+      if (Date.now() - last > 5000) { last = Date.now(); saveProgress(v.id, posRef.current, duration); }
+    };
+    const onPlay = () => { setPaused(false); setWaiting(false); };
+    const onPause = () => { setPaused(true); saveProgress(v.id, posRef.current, duration); };
+    const onWait = () => setWaiting(true);
+    const onPlaying = () => setWaiting(false);
+    const onEnded = () => { saveProgress(v.id, duration, duration); if (next) location.hash = `#/watch/${next.id}`; };
+    const onErr = () => setError(streamMode
+      ? 'Не удалось запустить перекодирование (сервер занят или файл повреждён).'
+      : 'Браузер не смог воспроизвести файл.');
+    const evs = { loadedmetadata: onMeta, timeupdate: onTime, play: onPlay, pause: onPause, waiting: onWait, playing: onPlaying, ended: onEnded, error: onErr };
+    for (const [k, f] of Object.entries(evs)) el.addEventListener(k, f);
+    return () => {
+      saveProgress(v.id, posRef.current, duration);
+      for (const [k, f] of Object.entries(evs)) el.removeEventListener(k, f);
+    };
+  }, [src]);
+
+  // show the single rendered subtitle track
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
-    setError('');
-    const saved = loadProgress()[v.id];
-    const onMeta = () => { if (saved && saved.t > 5) el.currentTime = saved.t - 3; };
-    let last = 0;
-    const onTime = () => {
-      if (Date.now() - last > 5000) { last = Date.now(); saveProgress(v.id, el.currentTime, el.duration); }
+    const t = setTimeout(() => { for (const tr of el.textTracks) tr.mode = 'showing'; }, 50);
+    return () => clearTimeout(t);
+  }, [sub, subOffset, src]);
+
+  const restartAt = (t) => { setCur(0); setOffset(Math.max(0, Math.min(t, duration - 1))); };
+
+  const seek = (t) => {
+    if (!streamMode) { ref.current.currentTime = t; return; }
+    restartAt(t);
+  };
+  const onSeekInput = (e) => {
+    const t = Number(e.target.value);
+    setSeekVal(t);
+    clearTimeout(seekTimer.current);
+    seekTimer.current = setTimeout(() => { setSeekVal(null); seek(t); }, 350);
+  };
+
+  const chooseAudio = (i) => {
+    const a = info.audio[i];
+    savePrefs({ audio: { lang: a.lang, title: a.title } });
+    const at = posRef.current;
+    setAudio(i);
+    setCur(0);
+    setOffset(at);
+  };
+  const subsList = info ? [
+    ...v.subs.map((s) => ({ key: 'ext:' + s.id, lang: s.lang, title: s.label, label: s.label + ' (файл)' })),
+    ...info.subs.map((s) => ({ key: 'emb:' + s.index, lang: s.lang, title: s.title, label: [s.lang.toUpperCase(), s.title].filter(Boolean).join(' · ') || `Дорожка ${s.index + 1}` })),
+  ] : [];
+  const chooseSub = (key) => {
+    setSub(key);
+    const s = subsList.find((x) => x.key === key);
+    savePrefs({ sub: s ? { lang: s.lang, title: s.title } : 'off' });
+  };
+  const subSrc = sub.startsWith('ext:')
+    ? `/api/subtitle/${sub.slice(4)}?offset=${subOffset.toFixed(1)}`
+    : sub.startsWith('emb:')
+      ? `/api/subtitle-embedded/${v.id}/${sub.slice(4)}?offset=${subOffset.toFixed(1)}`
+      : null;
+
+  const togglePlay = () => { const el = ref.current; el.paused ? el.play() : el.pause(); };
+  const fullscreen = () => {
+    if (document.fullscreenElement) return document.exitFullscreen();
+    if (wrap.current.requestFullscreen) wrap.current.requestFullscreen();
+    else ref.current.webkitEnterFullscreen?.();
+  };
+
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || !ref.current) return;
+      if (e.code === 'Space') { e.preventDefault(); togglePlay(); }
+      if (e.code === 'ArrowRight') seek(Math.min(duration - 1, posRef.current + 10));
+      if (e.code === 'ArrowLeft') seek(Math.max(0, posRef.current - 10));
+      if (e.code === 'KeyF') fullscreen();
     };
-    const onPause = () => saveProgress(v.id, el.currentTime, el.duration);
-    const onEnded = () => { saveProgress(v.id, el.duration, el.duration); if (next) location.hash = `#/watch/${next.id}`; };
-    const onErr = () => setError('Браузер не может воспроизвести этот файл (кодек/контейнер). См. README: перепаковка через ffmpeg.');
-    el.addEventListener('loadedmetadata', onMeta);
-    el.addEventListener('timeupdate', onTime);
-    el.addEventListener('pause', onPause);
-    el.addEventListener('ended', onEnded);
-    el.addEventListener('error', onErr);
-    return () => {
-      onPause();
-      el.removeEventListener('loadedmetadata', onMeta);
-      el.removeEventListener('timeupdate', onTime);
-      el.removeEventListener('pause', onPause);
-      el.removeEventListener('ended', onEnded);
-      el.removeEventListener('error', onErr);
-    };
-  }, [v.id]);
+    addEventListener('keydown', onKey);
+    return () => removeEventListener('keydown', onKey);
+  });
 
   return (
     <div className="player">
@@ -171,11 +306,56 @@ function Player({ v, list }) {
         <h1 title={v.file}>{v.title}</h1>
         {next && <a className="ghost" href={`#/watch/${next.id}`}>Далее →</a>}
       </header>
-      <video key={v.id} ref={ref} controls autoPlay playsInline preload="metadata" src={`/api/stream/${v.id}`}>
-        {v.subs.map((s) => (
-          <track key={s.id} kind="subtitles" label={s.label} srcLang={s.lang} src={`/api/subtitle/${s.id}`} />
-        ))}
-      </video>
+
+      <div className="stage" ref={wrap}>
+        {src && (
+          <video
+            key={src}
+            ref={ref}
+            src={src}
+            autoPlay
+            playsInline
+            preload="metadata"
+            controls={!streamMode}
+            onClick={streamMode ? togglePlay : undefined}
+          >
+            {subSrc && <track key={subSrc} kind="subtitles" label="sub" srcLang="und" src={subSrc} default />}
+          </video>
+        )}
+        {!info && !error && <p className="empty">Читаю файл…</p>}
+        {streamMode && waiting && <div className="spinner">⏳</div>}
+
+        {streamMode && (
+          <div className="bar">
+            <button className="ghost" onClick={togglePlay}>{paused ? '▶' : '❚❚'}</button>
+            <span className="time">{fmtTime(seekVal ?? pos)}</span>
+            <input type="range" min="0" max={Math.floor(duration)} step="1" value={Math.floor(seekVal ?? pos)} onChange={onSeekInput} />
+            <span className="time">{fmtTime(duration)}</span>
+            <button className="ghost" onClick={fullscreen}>⛶</button>
+          </div>
+        )}
+      </div>
+
+      {info && (
+        <div className="opts">
+          {info.audio.length > 1 && (
+            <label>Звук
+              <select value={audio} onChange={(e) => chooseAudio(Number(e.target.value))}>
+                {info.audio.map((a) => <option key={a.index} value={a.index}>{audioLabel(a)}</option>)}
+              </select>
+            </label>
+          )}
+          {subsList.length > 0 && (
+            <label>Субтитры
+              <select value={sub} onChange={(e) => chooseSub(e.target.value)}>
+                <option value="off">Выкл</option>
+                {subsList.map((s) => <option key={s.key} value={s.key}>{s.label}</option>)}
+              </select>
+            </label>
+          )}
+          <span className="mode">{MODE_LABEL[mode]}</span>
+        </div>
+      )}
       {error && <p className="err">{error}</p>}
       <p className="hint">{v.folder ? v.folder + ' / ' : ''}{v.file} · {fmtSize(v.size)}</p>
     </div>
