@@ -1,0 +1,284 @@
+// Home cinema: a small streaming API for a private video folder.
+// Config via environment variables (see README / .env.example).
+import express from 'express';
+import fs from 'node:fs';
+import fsp from 'node:fs/promises';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+const MEDIA_ROOT = path.resolve(process.env.MEDIA_ROOT || '/mnt/usb/videos');
+const PORT = Number(process.env.PORT || 8090);
+const HOST = process.env.HOST || '0.0.0.0';
+const PASSWORD = process.env.CINEMA_PASSWORD;
+// Keep CINEMA_SECRET stable, otherwise every restart logs everyone out.
+const SECRET = process.env.CINEMA_SECRET || crypto.randomBytes(32).toString('hex');
+const SESSION_DAYS = Number(process.env.SESSION_DAYS || 30);
+const SCAN_TTL_MS = 60_000;
+
+if (!PASSWORD) {
+  console.error('CINEMA_PASSWORD is not set — refusing to start without a password.');
+  process.exit(1);
+}
+
+// ---------- media types ----------
+// "play": how likely a browser can play it directly (no transcoding on the Pi).
+const VIDEO_TYPES = {
+  '.mp4': { mime: 'video/mp4', play: 'yes' },
+  '.m4v': { mime: 'video/mp4', play: 'yes' },
+  '.webm': { mime: 'video/webm', play: 'yes' },
+  '.mov': { mime: 'video/mp4', play: 'maybe' },
+  '.mkv': { mime: 'video/x-matroska', play: 'maybe' },
+  '.avi': { mime: 'video/x-msvideo', play: 'no' },
+  '.ts': { mime: 'video/mp2t', play: 'no' },
+};
+const SUB_EXT = new Set(['.srt', '.vtt']);
+
+// ---------- ids: base64url of the path relative to MEDIA_ROOT ----------
+const toId = (rel) => Buffer.from(rel, 'utf8').toString('base64url');
+
+function resolveId(id, allowedExt) {
+  let rel;
+  try {
+    rel = Buffer.from(String(id), 'base64url').toString('utf8');
+  } catch {
+    return null;
+  }
+  const abs = path.resolve(MEDIA_ROOT, rel);
+  // path traversal guard
+  if (abs !== MEDIA_ROOT && !abs.startsWith(MEDIA_ROOT + path.sep)) return null;
+  if (!allowedExt(path.extname(abs).toLowerCase())) return null;
+  return abs;
+}
+
+// ---------- library scan (cached) ----------
+let cache = { at: 0, data: null, pending: null };
+
+async function walk(dir, out) {
+  let entries;
+  try {
+    entries = await fsp.readdir(dir, { withFileTypes: true });
+  } catch (e) {
+    console.warn('cannot read', dir, e.code);
+    return;
+  }
+  const files = entries.filter((e) => e.isFile()).map((e) => e.name);
+  const subs = files.filter((f) => SUB_EXT.has(path.extname(f).toLowerCase()));
+
+  for (const name of files) {
+    const ext = path.extname(name).toLowerCase();
+    const type = VIDEO_TYPES[ext];
+    if (!type || name.startsWith('.')) continue;
+    const abs = path.join(dir, name);
+    const rel = path.relative(MEDIA_ROOT, abs);
+    const st = await fsp.stat(abs).catch(() => null);
+    if (!st) continue;
+    const base = path.basename(name, path.extname(name));
+    const tracks = subs
+      .filter((s) => s.startsWith(base))
+      .map((s) => {
+        // "Movie.ru.srt" -> label "ru"; "Movie.srt" -> "Subtitles"
+        const middle = path.basename(s, path.extname(s)).slice(base.length).replace(/^[._\s-]+/, '');
+        return { id: toId(path.relative(MEDIA_ROOT, path.join(dir, s))), label: middle || 'Subtitles', lang: middle.slice(0, 2) || 'und' };
+      });
+    out.push({
+      id: toId(rel),
+      title: base.replace(/[._]+/g, ' ').trim(),
+      file: name,
+      folder: path.dirname(rel) === '.' ? '' : path.dirname(rel),
+      size: st.size,
+      mtime: st.mtimeMs,
+      play: type.play,
+      subs: tracks,
+    });
+  }
+  for (const e of entries) {
+    if (e.isDirectory() && !e.name.startsWith('.') && e.name !== '$RECYCLE.BIN' && e.name !== 'System Volume Information') {
+      await walk(path.join(dir, e.name), out);
+    }
+  }
+}
+
+async function getLibrary(force = false) {
+  if (!force && cache.data && Date.now() - cache.at < SCAN_TTL_MS) return cache.data;
+  if (cache.pending) return cache.pending;
+  cache.pending = (async () => {
+    const out = [];
+    await walk(MEDIA_ROOT, out);
+    out.sort((a, b) => a.folder.localeCompare(b.folder) || a.title.localeCompare(b.title, undefined, { numeric: true }));
+    cache = { at: Date.now(), data: out, pending: null };
+    return out;
+  })();
+  try {
+    return await cache.pending;
+  } finally {
+    cache.pending = null;
+  }
+}
+
+// ---------- auth: signed cookie ----------
+const sign = (v) => crypto.createHmac('sha256', SECRET).update(v).digest('base64url');
+const sha = (s) => crypto.createHash('sha256').update(String(s)).digest();
+
+function makeToken() {
+  const exp = String(Date.now() + SESSION_DAYS * 864e5);
+  return `${exp}.${sign(exp)}`;
+}
+function validToken(tok) {
+  if (!tok) return false;
+  const [exp, sig] = tok.split('.');
+  if (!exp || !sig) return false;
+  const good = sign(exp);
+  if (sig.length !== good.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(good))) return false;
+  return Number(exp) > Date.now();
+}
+function getCookie(req, name) {
+  const raw = req.headers.cookie || '';
+  for (const part of raw.split(';')) {
+    const [k, ...v] = part.trim().split('=');
+    if (k === name) return decodeURIComponent(v.join('='));
+  }
+  return null;
+}
+
+// naive brute-force protection: 10 failures per IP -> 15 min block
+const failures = new Map();
+function blocked(ip) {
+  const f = failures.get(ip);
+  return f && f.count >= 10 && Date.now() - f.last < 15 * 60_000;
+}
+function fail(ip) {
+  const f = failures.get(ip) || { count: 0, last: 0 };
+  if (Date.now() - f.last > 15 * 60_000) f.count = 0;
+  f.count++;
+  f.last = Date.now();
+  failures.set(ip, f);
+}
+
+// ---------- app ----------
+const app = express();
+app.disable('x-powered-by');
+app.set('trust proxy', 'loopback, uniquelocal'); // nginx on EC2 via WireGuard
+app.use(express.json({ limit: '10kb' }));
+
+app.post('/api/login', (req, res) => {
+  const ip = req.ip;
+  if (blocked(ip)) return res.status(429).json({ error: 'Too many attempts, try later' });
+  const pw = req.body?.password ?? '';
+  if (!crypto.timingSafeEqual(sha(pw), sha(PASSWORD))) {
+    fail(ip);
+    return setTimeout(() => res.status(401).json({ error: 'Wrong password' }), 700);
+  }
+  failures.delete(ip);
+  res.cookie('cinema', makeToken(), {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: req.secure,
+    maxAge: SESSION_DAYS * 864e5,
+    path: '/',
+  });
+  res.json({ ok: true });
+});
+
+app.post('/api/logout', (req, res) => {
+  res.clearCookie('cinema', { path: '/' });
+  res.json({ ok: true });
+});
+
+// everything else under /api requires a session
+app.use('/api', (req, res, next) => {
+  if (validToken(getCookie(req, 'cinema'))) return next();
+  res.status(401).json({ error: 'Unauthorized' });
+});
+
+app.get('/api/me', (req, res) => res.json({ ok: true }));
+
+app.get('/api/videos', async (req, res) => {
+  res.json(await getLibrary(req.query.refresh === '1'));
+});
+
+// The core: byte-range streaming so the browser can seek.
+app.get('/api/stream/:id', async (req, res) => {
+  const file = resolveId(req.params.id, (ext) => ext in VIDEO_TYPES);
+  if (!file) return res.sendStatus(404);
+  let st;
+  try {
+    st = await fsp.stat(file);
+  } catch {
+    return res.sendStatus(404);
+  }
+  const size = st.size;
+  res.setHeader('Accept-Ranges', 'bytes');
+  res.setHeader('Content-Type', VIDEO_TYPES[path.extname(file).toLowerCase()].mime);
+  res.setHeader('Cache-Control', 'private, max-age=3600');
+
+  const range = req.headers.range;
+  let start = 0;
+  let end = size - 1;
+
+  if (range) {
+    const m = /^bytes=(\d*)-(\d*)$/.exec(range.trim());
+    if (!m || (m[1] === '' && m[2] === '')) {
+      res.setHeader('Content-Range', `bytes */${size}`);
+      return res.sendStatus(416);
+    }
+    if (m[1] === '') {
+      // suffix range: last N bytes
+      start = Math.max(0, size - Number(m[2]));
+    } else {
+      start = Number(m[1]);
+      if (m[2] !== '') end = Math.min(Number(m[2]), size - 1);
+    }
+    if (start > end || start >= size) {
+      res.setHeader('Content-Range', `bytes */${size}`);
+      return res.sendStatus(416);
+    }
+    res.status(206);
+    res.setHeader('Content-Range', `bytes ${start}-${end}/${size}`);
+  }
+  res.setHeader('Content-Length', end - start + 1);
+  if (req.method === 'HEAD') return res.end();
+
+  const stream = fs.createReadStream(file, { start, end, highWaterMark: 1 << 20 });
+  stream.on('error', () => res.destroy());
+  res.on('close', () => stream.destroy());
+  stream.pipe(res);
+});
+
+// Subtitles: .srt converted to WebVTT on the fly; cp1251 files are handled too.
+app.get('/api/subtitle/:id', async (req, res) => {
+  const file = resolveId(req.params.id, (ext) => SUB_EXT.has(ext));
+  if (!file) return res.sendStatus(404);
+  let buf;
+  try {
+    buf = await fsp.readFile(file);
+  } catch {
+    return res.sendStatus(404);
+  }
+  let text;
+  try {
+    text = new TextDecoder('utf-8', { fatal: true }).decode(buf);
+  } catch {
+    text = new TextDecoder('windows-1251').decode(buf);
+  }
+  text = text.replace(/^﻿/, '').replace(/\r\n?/g, '\n');
+  if (path.extname(file).toLowerCase() === '.srt') {
+    text = 'WEBVTT\n\n' + text.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2');
+  }
+  res.type('text/vtt; charset=utf-8').send(text);
+});
+
+// ---------- static UI ----------
+const DIST = path.join(__dirname, 'web', 'dist');
+app.use(express.static(DIST, { index: false, maxAge: '1h' }));
+app.get('*', (req, res, next) => {
+  if (req.path.startsWith('/api')) return next();
+  res.sendFile(path.join(DIST, 'index.html'), (err) => err && res.status(500).send('UI not built: run `npm run build`'));
+});
+
+app.listen(PORT, HOST, () => {
+  console.log(`home-cinema on http://${HOST}:${PORT}, media: ${MEDIA_ROOT}`);
+  getLibrary().then((l) => console.log(`indexed ${l.length} videos`));
+});

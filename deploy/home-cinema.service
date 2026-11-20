@@ -1,0 +1,21 @@
+[Unit]
+Description=Home cinema (Node.js video streaming)
+After=network-online.target
+Wants=network-online.target
+# Если диск монтируется через fstab, раскомментируйте и подставьте точку монтирования:
+# RequiresMountsFor=/mnt/usb
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/opt/home-cinema
+EnvironmentFile=/opt/home-cinema/.env
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+RestartSec=5
+# базовая изоляция сервиса
+ProtectSystem=full
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
