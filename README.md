@@ -49,6 +49,15 @@
 7. `sudo cp deploy/home-cinema.service /etc/systemd/system/` (поправьте `User=` при необходимости).
 8. `sudo systemctl enable --now home-cinema`
 
+## Обновление
+
+```bash
+/srv/storage/apps/streamserver/deploy.sh
+```
+
+Скрипт делает `git pull`, при изменении зависимостей — `npm install`, собирает UI, перезапускает службу
+и показывает, какие коммиты приехали. Если служба не поднялась — выводит последние строки журнала.
+
 ## Доступ извне через EC2
 
 Пример конфигурации nginx — `deploy/nginx-ec2.conf`: домен → WireGuard-IP mediaserver, порт 8090,
