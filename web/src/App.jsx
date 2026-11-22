@@ -164,6 +164,10 @@ function Player({ v, list }) {
   const [sub, setSub] = useState('off');
   const [offset, setOffset] = useState(0); // where the current ffmpeg stream starts
   const [ss, setSs] = useState(0); // exact ffmpeg seek position for that start
+  const [nonce, setNonce] = useState(0); // forces a new request even for the same start
+  const [notice, setNotice] = useState('');
+  const retries = useRef(0);
+  const watchdog = useRef(null);
   const [cur, setCur] = useState(0);
   const [paused, setPaused] = useState(true);
   const [seekVal, setSeekVal] = useState(null);
@@ -176,7 +180,7 @@ function Player({ v, list }) {
   // 1. find out what is inside the file
   useEffect(() => {
     let cancelled = false;
-    setInfo(null); setError(''); setCur(0);
+    setInfo(null); setError(''); setNotice(''); setCur(0); retries.current = 0;
     api(`/api/probe/${v.id}`)
       .then((i) => {
         if (cancelled) return;
@@ -211,7 +215,7 @@ function Player({ v, list }) {
   const subOffset = streamMode ? offset : 0;
 
   const src = !info ? null : streamMode
-    ? `/api/transcode/${v.id}?start=${offset.toFixed(3)}&ss=${ss.toFixed(3)}&audio=${audio}`
+    ? `/api/transcode/${v.id}?start=${offset.toFixed(3)}&ss=${ss.toFixed(3)}&audio=${audio}&n=${nonce}`
     : `/api/stream/${v.id}`;
 
   const posRef = useRef(0);
@@ -223,22 +227,46 @@ function Player({ v, list }) {
     if (!el || !src) return;
     setError('');
     let last = 0;
+    // transcoded streams can break (dropped connection, server restart): resume from the current position
+    const recover = (why) => {
+      clearTimeout(watchdog.current);
+      if (retries.current >= 4) {
+        setNotice('');
+        setError('Поток прерывается. Попробуйте позже или перемотайте вручную.');
+        return;
+      }
+      retries.current++;
+      console.warn('stream recover:', why, 'at', posRef.current);
+      setNotice('Переподключение…');
+      restartAt(posRef.current);
+    };
     const onMeta = () => { if (!streamMode && offset > 0) el.currentTime = offset; };
     const onTime = () => {
       setCur(el.currentTime);
+      if (el.currentTime > 5) retries.current = 0;
       if (Date.now() - last > 5000) { last = Date.now(); saveProgress(v.id, posRef.current, duration); }
     };
-    const onPlay = () => { setPaused(false); setWaiting(false); };
+    const onPlay = () => { setPaused(false); setWaiting(false); setNotice(''); };
     const onPause = () => { setPaused(true); saveProgress(v.id, posRef.current, duration); };
-    const onWait = () => setWaiting(true);
-    const onPlaying = () => setWaiting(false);
-    const onEnded = () => { saveProgress(v.id, duration, duration); if (next) location.hash = `#/watch/${next.id}`; };
-    const onErr = () => setError(streamMode
-      ? 'Не удалось запустить перекодирование (сервер занят или файл повреждён).'
-      : 'Браузер не смог воспроизвести файл.');
+    const onWait = () => {
+      setWaiting(true);
+      clearTimeout(watchdog.current);
+      if (streamMode) watchdog.current = setTimeout(() => recover('stalled'), 15000);
+    };
+    const onPlaying = () => { setWaiting(false); setNotice(''); clearTimeout(watchdog.current); };
+    const onEnded = () => {
+      if (streamMode && duration && posRef.current < duration - 5) return recover('ended early');
+      saveProgress(v.id, duration, duration);
+      if (next) location.hash = `#/watch/${next.id}`;
+    };
+    const onErr = () => {
+      if (streamMode) return recover('error ' + (el.error?.code ?? ''));
+      setError('Браузер не смог воспроизвести файл.');
+    };
     const evs = { loadedmetadata: onMeta, timeupdate: onTime, play: onPlay, pause: onPause, waiting: onWait, playing: onPlaying, ended: onEnded, error: onErr };
     for (const [k, f] of Object.entries(evs)) el.addEventListener(k, f);
     return () => {
+      clearTimeout(watchdog.current);
       saveProgress(v.id, posRef.current, duration);
       for (const [k, f] of Object.entries(evs)) el.removeEventListener(k, f);
     };
@@ -260,6 +288,7 @@ function Player({ v, list }) {
     setAudio(a);
     setOffset(p.start);
     setSs(p.ss);
+    setNonce((n) => n + 1);
   };
 
   const seek = (t) => {
@@ -371,6 +400,7 @@ function Player({ v, list }) {
           <span className="mode">{MODE_LABEL[mode]}</span>
         </div>
       )}
+      {notice && !error && <p className="hint">{notice}</p>}
       {error && <p className="err">{error}</p>}
       <p className="hint">{v.folder ? v.folder + ' / ' : ''}{v.file} · {fmtSize(v.size)}</p>
     </div>

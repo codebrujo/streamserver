@@ -304,7 +304,7 @@ app.get('/api/transcode/:id', async (req, res) => {
   // ss = actual ffmpeg seek position from /api/seekpoint (slightly after the keyframe at `start`)
   let ss = Number(req.query.ss);
   if (!Number.isFinite(ss) || ss < start || ss > start + 1) ss = start;
-  streamTranscode(req, res, file, info, { ss, audio });
+  streamTranscode(req, res, file, info, { ss, audio, session: getCookie(req, 'cinema') || req.ip });
 });
 
 // Exact position a stream will start from (keyframe when video is copied).

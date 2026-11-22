@@ -136,8 +136,21 @@ export async function seekPoint(file, info, t, audioIdx) {
 
 // ---------- streaming transcode ----------
 let active = 0;
+// one live stream per viewer session: a new request (seek, audio switch, reconnect) replaces the old one
+const bySession = new Map();
 
-export function streamTranscode(req, res, file, info, { ss = 0, audio = 0 } = {}) {
+export function streamTranscode(req, res, file, info, { ss = 0, audio = 0, session = '' } = {}) {
+  // The output is generated on the fly and can't be resumed at a byte offset. Browsers send
+  // "Range: bytes=N-" when they reconnect after a dropped connection; refuse it so the player
+  // restarts the stream at the right *time* instead of receiving the wrong bytes.
+  const m = /^bytes=(\d+)-/.exec(req.headers.range || '');
+  if (m && Number(m[1]) > 0) {
+    res.setHeader('Content-Range', 'bytes */*');
+    return res.sendStatus(416);
+  }
+  const prev = session && bySession.get(session);
+  if (prev) prev.destroy(); // frees its ffmpeg via the 'close' handler below
+
   if (active >= MAX_TRANSCODES) {
     return res.status(503).json({ error: 'Too many simultaneous streams, try again in a moment' });
   }
@@ -168,6 +181,10 @@ export function streamTranscode(req, res, file, info, { ss = 0, audio = 0 } = {}
 
   const ff = spawn(FFMPEG, args, { stdio: ['ignore', 'pipe', 'pipe'] });
   active++;
+  if (session) bySession.set(session, res);
+  const t0 = Date.now();
+  let bytes = 0;
+  ff.stdout.on('data', (d) => (bytes += d.length));
   let stderr = '';
   ff.stderr.on('data', (d) => {
     if (stderr.length < 4000) stderr += d;
@@ -196,7 +213,9 @@ export function streamTranscode(req, res, file, info, { ss = 0, audio = 0 } = {}
   ff.stdout.pipe(res);
   // viewer closed the tab or seeked -> stop ffmpeg right away
   res.on('close', () => {
+    if (session && bySession.get(session) === res) bySession.delete(session);
     if (!finished) ff.kill('SIGKILL');
+    console.log(`stream ${path.basename(file)} @${ss.toFixed(0)}s [${p.mode}] closed after ${((Date.now() - t0) / 1000).toFixed(0)}s, ${(bytes / 1e6).toFixed(1)} MB`);
   });
 }
 
