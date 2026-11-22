@@ -83,12 +83,106 @@ function Card({ v, progress }) {
   );
 }
 
+// compact row for folder contents and search results
+function Row({ v, progress }) {
+  const pct = progress?.d ? Math.min(100, (progress.t / progress.d) * 100) : 0;
+  return (
+    <a className="row" href={`#/watch/${v.id}`}>
+      <span className="play">▶</span>
+      <span className="rtitle" title={v.file}>{v.title}</span>
+      <span className="rmeta">{v.subs.length > 0 && 'CC · '}{fmtSize(v.size)}</span>
+      {pct > 0 && <i style={{ width: pct + '%' }} />}
+    </a>
+  );
+}
+
+const Chevron = () => (
+  <svg className="chev" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+    <path d="M6 3l5 5-5 5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+  </svg>
+);
+
+// ---------- folder tree ----------
+function buildTree(videos) {
+  const root = { name: '', path: '', children: new Map(), videos: [], count: 0 };
+  for (const v of videos) {
+    let node = root;
+    node.count++;
+    if (v.folder) {
+      let p = '';
+      for (const part of v.folder.split(/[\\/]/)) {
+        p = p ? p + '/' + part : part;
+        if (!node.children.has(part)) node.children.set(part, { name: part, path: p, children: new Map(), videos: [], count: 0 });
+        node = node.children.get(part);
+        node.count++;
+      }
+    }
+    node.videos.push(v);
+  }
+  return root;
+}
+const sortedChildren = (node) =>
+  [...node.children.values()].sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
+
+// expanded folders are remembered, so coming back from the player keeps the same view
+const OPEN_KEY = 'cinema.open';
+const loadOpen = () => {
+  try { return new Set(JSON.parse(localStorage.getItem(OPEN_KEY)) || []); } catch { return new Set(); }
+};
+
+function Folder({ node, depth, open, toggle, progress }) {
+  const isOpen = open.has(node.path);
+  const watching = useMemo(() => {
+    const walk = (n) => n.videos.some((v) => progress[v.id]) || [...n.children.values()].some(walk);
+    return walk(node);
+  }, [node, progress]);
+  return (
+    <div className="folder" style={{ '--depth': depth }}>
+      <button className={'folder-head' + (isOpen ? ' open' : '')} onClick={() => toggle(node.path)} aria-expanded={isOpen}>
+        <Chevron />
+        <span className="fname">{node.name}</span>
+        {watching && <span className="dot" title="Есть начатые" />}
+        <span className="count">{node.count}</span>
+      </button>
+      {isOpen && (
+        <div className="folder-body">
+          {sortedChildren(node).map((c) => (
+            <Folder key={c.path} node={c} depth={depth + 1} open={open} toggle={toggle} progress={progress} />
+          ))}
+          {node.videos.length > 0 && (
+            <div className="rows">{node.videos.map((v) => <Row key={v.id} v={v} progress={progress[v.id]} />)}</div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Library({ videos, onRefresh, onLogout }) {
   const [q, setQ] = useState('');
+  const [open, setOpen] = useState(loadOpen);
   const progress = loadProgress();
+
+  const toggle = (p) => {
+    setOpen((prev) => {
+      const next = new Set(prev);
+      if (next.has(p)) {
+        // closing a folder also closes everything inside it
+        for (const x of [...next]) if (x === p || x.startsWith(p + '/')) next.delete(x);
+      } else next.add(p);
+      try { localStorage.setItem(OPEN_KEY, JSON.stringify([...next])); } catch {}
+      return next;
+    });
+  };
+  const collapseAll = () => {
+    setOpen(new Set());
+    try { localStorage.removeItem(OPEN_KEY); } catch {}
+  };
+
+  const tree = useMemo(() => buildTree(videos), [videos]);
   const filtered = useMemo(() => {
     const s = q.trim().toLowerCase();
-    return s ? videos.filter((v) => (v.title + ' ' + v.folder).toLowerCase().includes(s)) : videos;
+    return s ? videos.filter((v) => (v.title + ' ' + v.folder).toLowerCase().includes(s)) : [];
   }, [q, videos]);
   const groups = useMemo(() => {
     const m = new Map();
@@ -111,19 +205,44 @@ function Library({ videos, onRefresh, onLogout }) {
         <button className="ghost" onClick={onRefresh} title="Пересканировать диск">⟳</button>
         <button className="ghost" onClick={onLogout} title="Выйти">⎋</button>
       </header>
-      {!q && cont.length > 0 && (
-        <section>
-          <h2>Продолжить просмотр</h2>
-          <div className="grid">{cont.map((v) => <Card key={v.id} v={v} progress={progress[v.id]} />)}</div>
-        </section>
+
+      {q ? (
+        <>
+          {groups.map(([folder, list]) => (
+            <section key={folder}>
+              <h2>{folder || 'Без папки'}</h2>
+              <div className="rows">{list.map((v) => <Row key={v.id} v={v} progress={progress[v.id]} />)}</div>
+            </section>
+          ))}
+          {filtered.length === 0 && <p className="empty">Ничего не найдено</p>}
+        </>
+      ) : (
+        <>
+          {cont.length > 0 && (
+            <section>
+              <h2>Продолжить просмотр</h2>
+              <div className="grid">{cont.map((v) => <Card key={v.id} v={v} progress={progress[v.id]} />)}</div>
+            </section>
+          )}
+          {videos.length > 0 && (
+            <section className="tree">
+              <h2>
+                Папки
+                {open.size > 0 && <button className="link" onClick={collapseAll}>свернуть все</button>}
+              </h2>
+              {sortedChildren(tree).map((c) => (
+                <Folder key={c.path} node={c} depth={0} open={open} toggle={toggle} progress={progress} />
+              ))}
+              {tree.videos.length > 0 && (
+                <Folder
+                  node={{ name: 'Без папки', path: '\u0000root', children: new Map(), videos: tree.videos, count: tree.videos.length }}
+                  depth={0} open={open} toggle={toggle} progress={progress}
+                />
+              )}
+            </section>
+          )}
+        </>
       )}
-      {groups.map(([folder, list]) => (
-        <section key={folder}>
-          <h2>{folder || 'Корень'}</h2>
-          <div className="grid">{list.map((v) => <Card key={v.id} v={v} progress={progress[v.id]} />)}</div>
-        </section>
-      ))}
-      {videos.length > 0 && filtered.length === 0 && <p className="empty">Ничего не найдено</p>}
       {videos.length === 0 && <p className="empty">Видео не найдено. Проверьте MEDIA_ROOT.</p>}
     </div>
   );
