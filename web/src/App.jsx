@@ -131,7 +131,6 @@ function Library({ videos, onRefresh, onLogout }) {
 
 const MODE_LABEL = {
   direct: 'оригинал',
-  remux: 'перепаковка',
   audio: 'перекодирование звука',
   video: 'перекодирование видео',
 };
@@ -151,6 +150,8 @@ const pickByPref = (items, pref) => {
   return i;
 };
 
+const seekPointOf = (id, t, a) => api(`/api/seekpoint/${id}?t=${t.toFixed(3)}&audio=${a}`);
+
 const audioLabel = (a) =>
   [a.lang && a.lang.toUpperCase(), a.title, a.codec, a.channels ? a.channels + 'ch' : ''].filter(Boolean).join(' · ');
 
@@ -162,6 +163,7 @@ function Player({ v, list }) {
   const [audio, setAudio] = useState(0);
   const [sub, setSub] = useState('off');
   const [offset, setOffset] = useState(0); // where the current ffmpeg stream starts
+  const [ss, setSs] = useState(0); // exact ffmpeg seek position for that start
   const [cur, setCur] = useState(0);
   const [paused, setPaused] = useState(true);
   const [seekVal, setSeekVal] = useState(null);
@@ -189,8 +191,14 @@ function Player({ v, list }) {
         const si = prefs.sub === 'off' ? -1 : pickByPref(subs, prefs.sub);
         setSub(si >= 0 ? subs[si].key : 'off');
         const saved = loadProgress()[v.id];
-        setOffset(saved && saved.t > 5 ? saved.t - 3 : 0);
-        setInfo(i);
+        const want = saved && saved.t > 5 ? saved.t - 3 : 0;
+        const streaming = (i.modes[a] || i.modes[0]) !== 'direct';
+        return (streaming && want > 0 ? seekPointOf(v.id, want, a) : Promise.resolve({ start: want, ss: want })).then((p) => {
+          if (cancelled) return;
+          setOffset(p.start);
+          setSs(p.ss);
+          setInfo(i);
+        });
       })
       .catch((e) => !cancelled && setError(e.message));
     return () => { cancelled = true; };
@@ -203,7 +211,7 @@ function Player({ v, list }) {
   const subOffset = streamMode ? offset : 0;
 
   const src = !info ? null : streamMode
-    ? `/api/transcode/${v.id}?start=${offset.toFixed(1)}&audio=${audio}`
+    ? `/api/transcode/${v.id}?start=${offset.toFixed(3)}&ss=${ss.toFixed(3)}&audio=${audio}`
     : `/api/stream/${v.id}`;
 
   const posRef = useRef(0);
@@ -244,7 +252,15 @@ function Player({ v, list }) {
     return () => clearTimeout(t);
   }, [sub, subOffset, src]);
 
-  const restartAt = (t) => { setCur(0); setOffset(Math.max(0, Math.min(t, duration - 1))); };
+  const restartAt = async (t, a = audio) => {
+    const want = Math.max(0, Math.min(t, duration - 1));
+    setWaiting(true);
+    const p = await seekPointOf(v.id, want, a).catch(() => ({ start: want, ss: want }));
+    setCur(0);
+    setAudio(a);
+    setOffset(p.start);
+    setSs(p.ss);
+  };
 
   const seek = (t) => {
     if (!streamMode) { ref.current.currentTime = t; return; }
@@ -261,9 +277,8 @@ function Player({ v, list }) {
     const a = info.audio[i];
     savePrefs({ audio: { lang: a.lang, title: a.title } });
     const at = posRef.current;
-    setAudio(i);
-    setCur(0);
-    setOffset(at);
+    if ((info.modes[i] || 'direct') === 'direct') { setAudio(i); setCur(0); setOffset(at); setSs(at); }
+    else restartAt(at, i);
   };
   const subsList = info ? [
     ...v.subs.map((s) => ({ key: 'ext:' + s.id, lang: s.lang, title: s.label, label: s.label + ' (файл)' })),

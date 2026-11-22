@@ -6,7 +6,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { probe, plan, streamTranscode, shiftVtt, embeddedVtt } from './transcode.js';
+import { probe, plan, seekPoint, streamTranscode, shiftVtt, embeddedVtt } from './transcode.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -301,7 +301,24 @@ app.get('/api/transcode/:id', async (req, res) => {
   }
   const start = Math.max(0, Math.min(Number(req.query.start) || 0, Math.max(0, info.duration - 1)));
   const audio = Math.max(0, Math.min(Number(req.query.audio) || 0, Math.max(0, info.audio.length - 1)));
-  streamTranscode(req, res, file, info, { start, audio });
+  // ss = actual ffmpeg seek position from /api/seekpoint (slightly after the keyframe at `start`)
+  let ss = Number(req.query.ss);
+  if (!Number.isFinite(ss) || ss < start || ss > start + 1) ss = start;
+  streamTranscode(req, res, file, info, { ss, audio });
+});
+
+// Exact position a stream will start from (keyframe when video is copied).
+app.get('/api/seekpoint/:id', async (req, res) => {
+  const file = resolveId(req.params.id, isVideo);
+  if (!file) return res.sendStatus(404);
+  try {
+    const info = await probe(file);
+    const t = Math.max(0, Math.min(Number(req.query.t) || 0, Math.max(0, info.duration - 1)));
+    const audio = Math.max(0, Math.min(Number(req.query.audio) || 0, Math.max(0, info.audio.length - 1)));
+    res.json(await seekPoint(file, info, t, audio));
+  } catch {
+    res.status(422).json({ error: 'Cannot read this file' });
+  }
 });
 
 // Text subtitles embedded in MKV/MP4, as WebVTT.

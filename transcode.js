@@ -14,9 +14,9 @@ const AUDIO_BITRATE = process.env.AUDIO_BITRATE || '192k';
 const DIRECT_CONTAINERS = new Set(['.mp4', '.m4v', '.webm']);
 const BROWSER_VIDEO = new Set(['h264', 'vp8', 'vp9', 'av1']);
 const BROWSER_AUDIO = new Set(['aac', 'mp3', 'opus', 'vorbis']);
-// Codecs we can copy straight into a fragmented MP4.
+// Codecs we can copy straight into a fragmented MP4. Audio is always re-encoded:
+// copied MP3/AAC from AVI and TV rips often has broken timestamps or gaps and drifts.
 const COPY_VIDEO = new Set(['h264']);
-const COPY_AUDIO = new Set(['aac', 'mp3']);
 const TEXT_SUBS = new Set(['subrip', 'ass', 'ssa', 'webvtt', 'mov_text', 'text']);
 
 // ---------- probe ----------
@@ -53,6 +53,7 @@ export async function probe(file) {
 
   const info = {
     duration: Number(j.format?.duration) || Number(v?.duration) || 0,
+    startTime: Number(j.format?.start_time) || 0,
     video: v ? { codec: v.codec_name, width: v.width, height: v.height, pixFmt: v.pix_fmt || '' } : null,
     audio: audio.map((s, i) => ({
       index: i,
@@ -85,16 +86,58 @@ export function plan(file, info, audioIdx = 0) {
   const direct = DIRECT_CONTAINERS.has(ext) && videoOk && audioOk && audioIdx === 0;
 
   const copyVideo = !!v && COPY_VIDEO.has(v.codec) && plainPix;
-  const copyAudio = !a || COPY_AUDIO.has(a.codec);
   let mode = 'direct';
-  if (!direct) mode = copyVideo && copyAudio ? 'remux' : copyVideo ? 'audio' : 'video';
-  return { mode, copyVideo, copyAudio };
+  if (!direct) mode = copyVideo ? 'audio' : 'video';
+  return { mode, copyVideo };
+}
+
+// ---------- seek point ----------
+// When video is copied, ffmpeg can only start at a keyframe. Find the keyframe at or before `t`
+// so the player knows exactly where the stream begins (timeline and subtitles stay correct).
+// `ss` is what we pass to ffmpeg: a bit after that keyframe (but before the next one), because
+// ffmpeg's MKV seeking falls back to the previous keyframe when -ss equals the keyframe time.
+export function keyframeBefore(file, info, t) {
+  if (t <= 0) return Promise.resolve({ start: 0, ss: 0 });
+  const base = info.startTime || 0;
+  const abs = base + t;
+  const from = Math.max(0, abs - 15);
+  return new Promise((resolve) => {
+    execFile(
+      FFPROBE,
+      ['-v', 'error', '-select_streams', 'V:0', '-show_entries', 'packet=pts_time,flags', '-of', 'csv=p=0',
+        '-read_intervals', `${from.toFixed(3)}%${(abs + 3).toFixed(3)}`, file],
+      { maxBuffer: 32 << 20, timeout: 15_000 },
+      (err, stdout) => {
+        if (err) return resolve({ start: t, ss: t });
+        const keys = [];
+        for (const line of stdout.split('\n')) {
+          const [pts, flags] = line.split(',');
+          const x = Number(pts);
+          if (flags && flags.includes('K') && Number.isFinite(x)) keys.push(x);
+        }
+        keys.sort((x, y) => x - y);
+        const before = keys.filter((x) => x <= abs + 0.001);
+        if (!before.length) return resolve({ start: t, ss: t });
+        const k = before[before.length - 1];
+        const next = keys.find((x) => x > k + 0.001);
+        const nudge = next ? Math.min(0.5, (next - k) / 2) : 0.5;
+        const start = Math.max(0, k - base);
+        resolve({ start, ss: start + nudge });
+      },
+    );
+  });
+}
+
+export async function seekPoint(file, info, t, audioIdx) {
+  const p = plan(file, info, audioIdx);
+  if (p.mode === 'direct' || !p.copyVideo) return { start: t, ss: t }; // re-encoded video starts exactly at t
+  return keyframeBefore(file, info, t);
 }
 
 // ---------- streaming transcode ----------
 let active = 0;
 
-export function streamTranscode(req, res, file, info, { start = 0, audio = 0 } = {}) {
+export function streamTranscode(req, res, file, info, { ss = 0, audio = 0 } = {}) {
   if (active >= MAX_TRANSCODES) {
     return res.status(503).json({ error: 'Too many simultaneous streams, try again in a moment' });
   }
@@ -103,7 +146,7 @@ export function streamTranscode(req, res, file, info, { start = 0, audio = 0 } =
 
   const args = ['-hide_banner', '-loglevel', 'error', '-nostdin'];
   if (ext === '.avi') args.push('-fflags', '+genpts'); // old Xvid/DivX files often lack timestamps
-  if (start > 0) args.push('-ss', start.toFixed(2));
+  if (ss > 0) args.push('-ss', ss.toFixed(3));
   args.push('-i', file, '-map', '0:V:0'); // V = real video, not cover art
   if (info.audio.length) args.push('-map', `0:a:${audio}`);
   args.push('-sn', '-dn');
@@ -117,9 +160,10 @@ export function streamTranscode(req, res, file, info, { start = 0, audio = 0 } =
     );
   }
   if (info.audio.length) {
-    if (p.copyAudio) args.push('-c:a', 'copy');
-    else args.push('-c:a', 'aac', '-b:a', AUDIO_BITRATE, '-ac', '2');
+    // async resampling keeps audio locked to timestamps: fills gaps with silence, trims overlaps
+    args.push('-af', 'aresample=async=1000:min_hard_comp=0.1', '-c:a', 'aac', '-b:a', AUDIO_BITRATE, '-ac', '2');
   }
+  args.push('-max_muxing_queue_size', '4096');
   args.push('-avoid_negative_ts', 'make_zero', '-movflags', 'frag_keyframe+empty_moov+default_base_moof', '-f', 'mp4', 'pipe:1');
 
   const ff = spawn(FFMPEG, args, { stdio: ['ignore', 'pipe', 'pipe'] });
