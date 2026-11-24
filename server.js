@@ -8,6 +8,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { sendRange, decodeText } from './util.js';
 import { createMusicRouter } from './music.js';
+import { startCacheJanitor } from './cache.js';
 import { probe, plan, seekPoint, streamTranscode, shiftVtt, embeddedVtt } from './transcode.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -311,6 +312,8 @@ app.get('*', (req, res, next) => {
   if (req.path.startsWith('/api')) return next();
   res.sendFile(path.join(DIST, 'index.html'), (err) => err && res.status(500).send('UI not built: run `npm run build`'));
 });
+
+startCacheJanitor(CACHE_DIR, { maxAgeDays: Number(process.env.CACHE_MAX_AGE_DAYS || 90) });
 
 app.listen(PORT, HOST, () => {
   console.log(`home-cinema on http://${HOST}:${PORT}, media: ${MEDIA_ROOT}`);
