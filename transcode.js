@@ -3,6 +3,7 @@ import { spawn, execFile } from 'node:child_process';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { touch } from './cache.js';
 
 const FFMPEG = process.env.FFMPEG || 'ffmpeg';
 const FFPROBE = process.env.FFPROBE || 'ffprobe';
@@ -272,7 +273,9 @@ export async function embeddedVtt(file, subIdx, cacheDir) {
   const key = crypto.createHash('sha1').update(`${file}:${st.mtimeMs}:${subIdx}`).digest('hex');
   const out = path.join(cacheDir, 'subs', key + '.vtt');
   try {
-    return await fsp.readFile(out, 'utf8');
+    const text = await fsp.readFile(out, 'utf8');
+    touch(out);
+    return text;
   } catch {}
   if (extracting.has(out)) return extracting.get(out);
 

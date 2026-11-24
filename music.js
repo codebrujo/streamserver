@@ -5,6 +5,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { sendRange, decodeText } from './util.js';
+import { touch } from './cache.js';
 
 const FFMPEG = process.env.FFMPEG || 'ffmpeg';
 const FFPROBE = process.env.FFPROBE || 'ffprobe';
@@ -273,8 +274,8 @@ export function createMusicRouter({ root, cacheDir, cacheLimitMb = 2048, ecoBitr
     const key = sha1(`${abs}:${st.mtimeMs}:${t.s ?? ''}:${t.e ?? ''}:${fmt}:${ecoBitrate}`);
     const out = path.join(AUDIO_CACHE, `${key}.${fmt}`);
     try {
-      const now = new Date();
-      await fsp.utimes(out, now, now); // mark as recently used
+      await fsp.access(out);
+      touch(out); // mark as recently used
       return out;
     } catch {}
     return ffmpegSlot(async () => {
@@ -406,6 +407,7 @@ export function createMusicRouter({ root, cacheDir, cacheLimitMb = 2048, ecoBitr
       const out = path.join(COVER_CACHE, sha1(`${src}:${st.mtimeMs}:${size}`) + '.jpg');
       try {
         await fsp.access(out);
+        touch(out);
       } catch {
         await fsp.mkdir(COVER_CACHE, { recursive: true });
         const tmp = `${out}.${Date.now()}.tmp`;
