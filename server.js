@@ -6,6 +6,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { probe, plan, seekPoint, streamTranscode, shiftVtt, embeddedVtt } from './transcode.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -17,6 +18,8 @@ const PASSWORD = process.env.CINEMA_PASSWORD;
 const SECRET = process.env.CINEMA_SECRET || crypto.randomBytes(32).toString('hex');
 const SESSION_DAYS = Number(process.env.SESSION_DAYS || 30);
 const SCAN_TTL_MS = 60_000;
+// probe results don't need it, but extracted embedded subtitles are cached here (put it on the SSD)
+const CACHE_DIR = path.resolve(process.env.CACHE_DIR || path.join(__dirname, 'cache'));
 
 if (!PASSWORD) {
   console.error('CINEMA_PASSWORD is not set — refusing to start without a password.');
@@ -24,15 +27,17 @@ if (!PASSWORD) {
 }
 
 // ---------- media types ----------
-// "play": how likely a browser can play it directly (no transcoding on the Pi).
+// Direct playback uses these MIME types; everything else goes through ffmpeg (see transcode.js).
 const VIDEO_TYPES = {
-  '.mp4': { mime: 'video/mp4', play: 'yes' },
-  '.m4v': { mime: 'video/mp4', play: 'yes' },
-  '.webm': { mime: 'video/webm', play: 'yes' },
-  '.mov': { mime: 'video/mp4', play: 'maybe' },
-  '.mkv': { mime: 'video/x-matroska', play: 'maybe' },
-  '.avi': { mime: 'video/x-msvideo', play: 'no' },
-  '.ts': { mime: 'video/mp2t', play: 'no' },
+  '.mp4': { mime: 'video/mp4' },
+  '.m4v': { mime: 'video/mp4' },
+  '.webm': { mime: 'video/webm' },
+  '.mov': { mime: 'video/mp4' },
+  '.mkv': { mime: 'video/x-matroska' },
+  '.avi': { mime: 'video/x-msvideo' },
+  '.ts': { mime: 'video/mp2t' },
+  '.mpg': { mime: 'video/mpeg' },
+  '.wmv': { mime: 'video/x-ms-wmv' },
 };
 const SUB_EXT = new Set(['.srt', '.vtt']);
 
@@ -69,8 +74,7 @@ async function walk(dir, out) {
 
   for (const name of files) {
     const ext = path.extname(name).toLowerCase();
-    const type = VIDEO_TYPES[ext];
-    if (!type || name.startsWith('.')) continue;
+    if (!VIDEO_TYPES[ext] || name.startsWith('.')) continue;
     const abs = path.join(dir, name);
     const rel = path.relative(MEDIA_ROOT, abs);
     const st = await fsp.stat(abs).catch(() => null);
@@ -90,7 +94,6 @@ async function walk(dir, out) {
       folder: path.dirname(rel) === '.' ? '' : path.dirname(rel),
       size: st.size,
       mtime: st.mtimeMs,
-      play: type.play,
       subs: tracks,
     });
   }
@@ -267,7 +270,69 @@ app.get('/api/subtitle/:id', async (req, res) => {
   if (path.extname(file).toLowerCase() === '.srt') {
     text = 'WEBVTT\n\n' + text.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2');
   }
-  res.type('text/vtt; charset=utf-8').send(text);
+  res.type('text/vtt; charset=utf-8').send(shiftVtt(text, Number(req.query.offset) || 0));
+});
+
+// ---------- ffmpeg-backed endpoints ----------
+const isVideo = (ext) => ext in VIDEO_TYPES;
+
+// What's inside the file and how the player should play it.
+app.get('/api/probe/:id', async (req, res) => {
+  const file = resolveId(req.params.id, isVideo);
+  if (!file) return res.sendStatus(404);
+  try {
+    const info = await probe(file);
+    const plans = info.audio.length ? info.audio.map((_, i) => plan(file, info, i).mode) : [plan(file, info, 0).mode];
+    res.json({ ...info, modes: plans });
+  } catch (e) {
+    res.status(422).json({ error: 'Cannot read this file (damaged or incomplete?)' });
+  }
+});
+
+// Fragmented MP4 produced by ffmpeg; seeking = new request with ?start=<seconds>.
+app.get('/api/transcode/:id', async (req, res) => {
+  const file = resolveId(req.params.id, isVideo);
+  if (!file) return res.sendStatus(404);
+  let info;
+  try {
+    info = await probe(file);
+  } catch {
+    return res.status(422).json({ error: 'Cannot read this file' });
+  }
+  const start = Math.max(0, Math.min(Number(req.query.start) || 0, Math.max(0, info.duration - 1)));
+  const audio = Math.max(0, Math.min(Number(req.query.audio) || 0, Math.max(0, info.audio.length - 1)));
+  // ss = actual ffmpeg seek position from /api/seekpoint (slightly after the keyframe at `start`)
+  let ss = Number(req.query.ss);
+  if (!Number.isFinite(ss) || ss < start || ss > start + 1) ss = start;
+  streamTranscode(req, res, file, info, { ss, audio, session: getCookie(req, 'cinema') || req.ip });
+});
+
+// Exact position a stream will start from (keyframe when video is copied).
+app.get('/api/seekpoint/:id', async (req, res) => {
+  const file = resolveId(req.params.id, isVideo);
+  if (!file) return res.sendStatus(404);
+  try {
+    const info = await probe(file);
+    const t = Math.max(0, Math.min(Number(req.query.t) || 0, Math.max(0, info.duration - 1)));
+    const audio = Math.max(0, Math.min(Number(req.query.audio) || 0, Math.max(0, info.audio.length - 1)));
+    res.json(await seekPoint(file, info, t, audio));
+  } catch {
+    res.status(422).json({ error: 'Cannot read this file' });
+  }
+});
+
+// Text subtitles embedded in MKV/MP4, as WebVTT.
+app.get('/api/subtitle-embedded/:id/:n', async (req, res) => {
+  const file = resolveId(req.params.id, isVideo);
+  const n = Number(req.params.n);
+  if (!file || !Number.isInteger(n) || n < 0) return res.sendStatus(404);
+  try {
+    const vtt = await embeddedVtt(file, n, CACHE_DIR);
+    res.type('text/vtt; charset=utf-8').send(shiftVtt(vtt, Number(req.query.offset) || 0));
+  } catch (e) {
+    console.error('subtitle extract failed:', e.message?.slice(0, 300));
+    res.sendStatus(500);
+  }
 });
 
 // ---------- static UI ----------
