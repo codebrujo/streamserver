@@ -6,6 +6,8 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { sendRange, decodeText } from './util.js';
+import { createMusicRouter } from './music.js';
 import { probe, plan, seekPoint, streamTranscode, shiftVtt, embeddedVtt } from './transcode.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -18,6 +20,8 @@ const PASSWORD = process.env.CINEMA_PASSWORD;
 const SECRET = process.env.CINEMA_SECRET || crypto.randomBytes(32).toString('hex');
 const SESSION_DAYS = Number(process.env.SESSION_DAYS || 30);
 const SCAN_TTL_MS = 60_000;
+// optional: folder with music; enables the "Музыка" tab
+const MUSIC_ROOT = process.env.MUSIC_ROOT ? path.resolve(process.env.MUSIC_ROOT) : null;
 // probe results don't need it, but extracted embedded subtitles are cached here (put it on the SSD)
 const CACHE_DIR = path.resolve(process.env.CACHE_DIR || path.join(__dirname, 'cache'));
 
@@ -196,7 +200,19 @@ app.use('/api', (req, res, next) => {
   res.status(401).json({ error: 'Unauthorized' });
 });
 
-app.get('/api/me', (req, res) => res.json({ ok: true }));
+app.get('/api/me', (req, res) => res.json({ ok: true, music: !!MUSIC_ROOT }));
+
+if (MUSIC_ROOT) {
+  app.use(
+    '/api/music',
+    createMusicRouter({
+      root: MUSIC_ROOT,
+      cacheDir: CACHE_DIR,
+      cacheLimitMb: Number(process.env.MUSIC_CACHE_MB || 2048),
+      ecoBitrate: process.env.MUSIC_ECO_BITRATE || '192k',
+    }),
+  );
+}
 
 app.get('/api/videos', async (req, res) => {
   res.json(await getLibrary(req.query.refresh === '1'));
@@ -206,48 +222,7 @@ app.get('/api/videos', async (req, res) => {
 app.get('/api/stream/:id', async (req, res) => {
   const file = resolveId(req.params.id, (ext) => ext in VIDEO_TYPES);
   if (!file) return res.sendStatus(404);
-  let st;
-  try {
-    st = await fsp.stat(file);
-  } catch {
-    return res.sendStatus(404);
-  }
-  const size = st.size;
-  res.setHeader('Accept-Ranges', 'bytes');
-  res.setHeader('Content-Type', VIDEO_TYPES[path.extname(file).toLowerCase()].mime);
-  res.setHeader('Cache-Control', 'private, max-age=3600');
-
-  const range = req.headers.range;
-  let start = 0;
-  let end = size - 1;
-
-  if (range) {
-    const m = /^bytes=(\d*)-(\d*)$/.exec(range.trim());
-    if (!m || (m[1] === '' && m[2] === '')) {
-      res.setHeader('Content-Range', `bytes */${size}`);
-      return res.sendStatus(416);
-    }
-    if (m[1] === '') {
-      // suffix range: last N bytes
-      start = Math.max(0, size - Number(m[2]));
-    } else {
-      start = Number(m[1]);
-      if (m[2] !== '') end = Math.min(Number(m[2]), size - 1);
-    }
-    if (start > end || start >= size) {
-      res.setHeader('Content-Range', `bytes */${size}`);
-      return res.sendStatus(416);
-    }
-    res.status(206);
-    res.setHeader('Content-Range', `bytes ${start}-${end}/${size}`);
-  }
-  res.setHeader('Content-Length', end - start + 1);
-  if (req.method === 'HEAD') return res.end();
-
-  const stream = fs.createReadStream(file, { start, end, highWaterMark: 1 << 20 });
-  stream.on('error', () => res.destroy());
-  res.on('close', () => stream.destroy());
-  stream.pipe(res);
+  sendRange(req, res, file, VIDEO_TYPES[path.extname(file).toLowerCase()].mime);
 });
 
 // Subtitles: .srt converted to WebVTT on the fly; cp1251 files are handled too.
@@ -260,13 +235,7 @@ app.get('/api/subtitle/:id', async (req, res) => {
   } catch {
     return res.sendStatus(404);
   }
-  let text;
-  try {
-    text = new TextDecoder('utf-8', { fatal: true }).decode(buf);
-  } catch {
-    text = new TextDecoder('windows-1251').decode(buf);
-  }
-  text = text.replace(/^﻿/, '').replace(/\r\n?/g, '\n');
+  let text = decodeText(buf);
   if (path.extname(file).toLowerCase() === '.srt') {
     text = 'WEBVTT\n\n' + text.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2');
   }

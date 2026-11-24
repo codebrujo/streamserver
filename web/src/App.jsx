@@ -1,19 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 
-// ---------- helpers ----------
-const api = async (url, opts) => {
-  const r = await fetch(url, { credentials: 'same-origin', ...opts });
-  if (r.status === 401) throw Object.assign(new Error('auth'), { auth: true });
-  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.statusText);
-  return r.json();
-};
-
-const fmtSize = (b) => (b > 1 << 30 ? (b / (1 << 30)).toFixed(1) + ' ГБ' : Math.round(b / (1 << 20)) + ' МБ');
-const fmtTime = (s) => {
-  s = Math.floor(s);
-  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
-  return (h ? h + ':' + String(m).padStart(2, '0') : m) + ':' + String(sec).padStart(2, '0');
-};
+import { api, fmtSize, fmtTime } from './lib.js';
+import { MusicProvider, MusicLibrary, MiniPlayer } from './Music.jsx';
 
 // watch progress lives in localStorage (per browser)
 const PROGRESS_KEY = 'cinema.progress';
@@ -158,7 +146,7 @@ function Folder({ node, depth, open, toggle, progress }) {
   );
 }
 
-function Library({ videos, onRefresh, onLogout }) {
+function Library({ videos, onRefresh, onLogout, tabs }) {
   const [q, setQ] = useState('');
   const [open, setOpen] = useState(loadOpen);
   const progress = loadProgress();
@@ -200,7 +188,7 @@ function Library({ videos, onRefresh, onLogout }) {
   return (
     <div className="lib">
       <header>
-        <h1>🎬 Кинотеатр</h1>
+        {tabs}
         <input type="search" placeholder="Поиск…" value={q} onChange={(e) => setQ(e.target.value)} />
         <button className="ghost" onClick={onRefresh} title="Пересканировать диск">⟳</button>
         <button className="ghost" onClick={onLogout} title="Выйти">⎋</button>
@@ -300,6 +288,7 @@ function Player({ v, list }) {
   useEffect(() => {
     let cancelled = false;
     setInfo(null); setError(''); setNotice(''); setCur(0); retries.current = 0;
+    dispatchEvent(new Event('cinema:video'));
     api(`/api/probe/${v.id}`)
       .then((i) => {
         if (cancelled) return;
@@ -529,13 +518,15 @@ function Player({ v, list }) {
 export default function App() {
   const [state, setState] = useState('loading'); // loading | login | ready | error
   const [videos, setVideos] = useState([]);
+  const [music, setMusic] = useState(false);
   const [err, setErr] = useState('');
   const hash = useHash();
 
   const load = async (refresh) => {
     try {
-      const list = await api('/api/videos' + (refresh ? '?refresh=1' : ''));
+      const [list, me] = await Promise.all([api('/api/videos' + (refresh ? '?refresh=1' : '')), api('/api/me')]);
       setVideos(list);
+      setMusic(!!me.music);
       setState('ready');
     } catch (e) {
       if (e.auth) setState('login');
@@ -550,10 +541,25 @@ export default function App() {
   if (state === 'login') return <Login onDone={() => load()} />;
   if (state === 'error') return <p className="err">Ошибка: {err}</p>;
 
+  const isMusic = hash.startsWith('#/music');
+  const tabs = music ? (
+    <nav className="tabs">
+      <a className={isMusic ? '' : 'on'} href="#/">🎬 Кино</a>
+      <a className={isMusic ? 'on' : ''} href="#/music">🎵 Музыка</a>
+    </nav>
+  ) : <h1>🎬 Кинотеатр</h1>;
+
+  let page;
   const m = hash.match(/^#\/watch\/(.+)$/);
-  if (m) {
-    const v = videos.find((x) => x.id === m[1]);
-    if (v) return <Player v={v} list={videos} />;
-  }
-  return <Library videos={videos} onRefresh={() => load(true)} onLogout={logout} />;
+  const v = m && videos.find((x) => x.id === m[1]);
+  if (v) page = <Player v={v} list={videos} />;
+  else if (isMusic && music) page = <MusicLibrary tabs={tabs} onLogout={logout} />;
+  else page = <Library videos={videos} onRefresh={() => load(true)} onLogout={logout} tabs={tabs} />;
+
+  return (
+    <MusicProvider enabled={music}>
+      <div className="page">{page}</div>
+      {!v && <MiniPlayer />}
+    </MusicProvider>
+  );
 }
