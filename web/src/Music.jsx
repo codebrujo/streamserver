@@ -198,6 +198,13 @@ export function MusicProvider({ enabled, children }) {
   );
 }
 
+// "FLAC 24/96 → AAC 192"; nothing when the file goes as-is or lossless stays the same codec (CUE cut)
+const deliverNote = (c, q) => {
+  const d = c.deliver?.[q];
+  if (!d || d === (c.quality || '').split(' ')[0]) return '';
+  return ` → ${d}`;
+};
+
 // ================= mini player =================
 export function MiniPlayer() {
   const m = useMusic();
@@ -233,9 +240,13 @@ export function MiniPlayer() {
       </div>
       <div className="mrow2">
         <span className="mtime">{fmtTime(shown)} / {fmtTime(m.dur)}</span>
+        {c.quality && (
+          <span className="mfmt" title="Формат файла → что передаётся сейчас">
+            {c.quality}{deliverNote(c, m.quality)}
+          </span>
+        )}
         {m.error && <span className="merr">{m.error}</span>}
-        <span className="spacer" />
-        <button className={'chip' + (m.shuffle ? ' on' : '')} onClick={m.toggleShuffle}>🔀 Перемешать</button>
+        <button className={'chip' + (m.shuffle ? ' on' : '')} onClick={m.toggleShuffle} title="Перемешать" aria-label="Перемешать" aria-pressed={m.shuffle}>🔀</button>
         <button
           className="chip"
           onClick={() => m.setQuality(m.quality === 'orig' ? 'eco' : 'orig')}
@@ -298,7 +309,8 @@ function Album({ path }) {
   const albumArtist = t[0].artist;
   const album = t[0].album;
   const total = t.reduce((a, x) => a + (x.duration || 0), 0);
-  const formats = [...new Set(t.map((x) => x.format.toUpperCase()))].join(', ');
+  const quals = [...new Set(t.map((x) => x.quality || x.format.toUpperCase()))];
+  const formats = quals.length <= 2 ? quals.join(', ') : [...new Set(t.map((x) => x.format.toUpperCase()))].join(', ');
   return (
     <div className="album">
       <div className="album-head">
@@ -324,6 +336,7 @@ function Album({ path }) {
                 {x.title}
                 {x.artist && x.artist !== albumArtist && <small> — {x.artist}</small>}
               </span>
+              {x.quality && <span className="fmt">{x.quality}</span>}
               <span className="rmeta">{fmtTime(x.duration)}</span>
             </button>
           );

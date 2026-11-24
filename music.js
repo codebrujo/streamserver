@@ -95,15 +95,32 @@ async function probeAudio(file) {
   for (const src of [j.format?.tags, j.streams?.[0]?.tags]) {
     for (const [k, v] of Object.entries(src || {})) tags[k.toLowerCase()] ??= v;
   }
+  const s = j.streams?.[0] || {};
   return {
     duration: Number(j.format?.duration) || 0,
-    codec: j.streams?.[0]?.codec_name || '',
+    codec: s.codec_name || '',
+    bitrate: Math.round((Number(s.bit_rate) || Number(j.format?.bit_rate) || 0) / 1000), // kbps
+    sampleRate: Number(s.sample_rate) || 0,
+    bits: Number(s.bits_per_raw_sample) || Number(s.bits_per_sample) || 0,
     title: tags.title || '',
     artist: tags.artist || tags.album_artist || '',
     album: tags.album || '',
     n: parseInt(tags.track, 10) || 0,
     date: tags.date || tags.year || '',
   };
+}
+
+// ---------- quality labels: "MP3 320", "FLAC 16/44.1", "FLAC 24/96" ----------
+const CODEC_NAMES = { alac: 'ALAC', aac: 'AAC', vorbis: 'OGG', opus: 'OPUS', wmav1: 'WMA', wmav2: 'WMA', wmapro: 'WMA', wmalossless: 'WMA LL' };
+export function qualityLabel(file, info) {
+  const e = ext(file);
+  const name = (['.m4a', '.ogg', '.oga', '.wma'].includes(e) && CODEC_NAMES[info.codec]) || e.slice(1).toUpperCase();
+  const lossless = LOSSLESS.has(e) || ['alac', 'wmalossless'].includes(info.codec);
+  const khz = info.sampleRate ? String(+(info.sampleRate / 1000).toFixed(1)) : '';
+  if (lossless && info.bits && khz) return `${name} ${info.bits}/${khz}`;
+  if (lossless && khz) return `${name} ${khz} кГц`;
+  if (!lossless && info.bitrate) return `${name} ${info.bitrate}`;
+  return name;
 }
 
 // ---------- router ----------
@@ -224,6 +241,8 @@ export function createMusicRouter({ root, cacheDir, cacheLimitMb = 2048, ecoBitr
             album: cue.title || info.album,
             duration: Math.max(0, end - t.start),
             format: ext(f).slice(1),
+            quality: qualityLabel(f, info),
+            deliver: deliverLabels({ f: fileRel, s: 1 }),
           });
         });
       } else {
@@ -235,6 +254,8 @@ export function createMusicRouter({ root, cacheDir, cacheLimitMb = 2048, ecoBitr
           album: info.album,
           duration: info.duration,
           format: ext(f).slice(1),
+          quality: qualityLabel(f, info),
+          deliver: deliverLabels({ f: fileRel }),
         });
       }
     }
@@ -266,6 +287,12 @@ export function createMusicRouter({ root, cacheDir, cacheLimitMb = 2048, ecoBitr
     if (whole && DIRECT[e] && !(q === 'eco' && LOSSLESS.has(e))) return null;
     if (q === 'eco' || !LOSSLESS.has(e)) return 'm4a';
     return 'flac';
+  }
+
+  // what the browser actually receives in each mode; null = the original file as-is
+  function deliverLabels(t) {
+    const label = (fmt) => (fmt == null ? null : fmt === 'flac' ? 'FLAC' : `AAC ${String(ecoBitrate).replace(/k$/i, '')}`);
+    return { orig: label(target(t, 'orig')), eco: label(target(t, 'eco')) };
   }
 
   async function prepare(abs, t, fmt) {
