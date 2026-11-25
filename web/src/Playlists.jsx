@@ -242,15 +242,60 @@ function ContentTab({ selected, setInPlaylist }) {
   );
 }
 
+const LIMIT = 5000; // same as the server
+
 function PickFolder({ node, label, open, toggle, selected, setInPlaylist }) {
   const isOpen = open.has(node.path);
+  const [adding, setAdding] = useState(false);
+  const [note, setNote] = useState('');
+  useEffect(() => {
+    if (!note) return;
+    const t = setTimeout(() => setNote(''), 3500);
+    return () => clearTimeout(t);
+  }, [note]);
+
+  // "+": every track of this folder and all subfolders, appended in tree order, without duplicates
+  const addAll = async () => {
+    setAdding(true);
+    try {
+      const d = await api(`/api/music/folder-deep?path=${encodeURIComponent(node.path)}`);
+      const fresh = d.tracks.filter((t) => !selected.has(t.id));
+      const room = Math.max(0, LIMIT - selected.size);
+      const add = fresh.slice(0, room);
+      if (add.length) setInPlaylist(add, true);
+      setNote(
+        !d.tracks.length ? 'нет треков'
+          : !fresh.length ? '✓ уже всё в плейлисте'
+          : add.length < fresh.length || d.truncated ? `+${add.length} (лимит ${LIMIT})`
+          : `+${add.length}`,
+      );
+    } catch {
+      setNote('ошибка');
+    } finally {
+      setAdding(false);
+    }
+  };
+
   return (
     <div className="folder">
-      <button className={'folder-head' + (isOpen ? ' open' : '')} onClick={() => toggle(node.path)} aria-expanded={isOpen}>
-        <Chevron />
-        <span className="fname">{label || node.name}</span>
-        <span className="count">{node.count}</span>
-      </button>
+      <div className={'pl-head' + (isOpen ? ' open' : '')}>
+        <button className="pl-toggle" onClick={() => toggle(node.path)} aria-expanded={isOpen}>
+          <Chevron />
+          <span className="fname">{label || node.name}</span>
+          {note ? <span className="added">{note}</span> : <span className="count">{node.count}</span>}
+        </button>
+        {node.path !== '' && (
+          <button
+            className="icon add"
+            onClick={addAll}
+            disabled={adding}
+            title="Добавить все треки папки и подпапок"
+            aria-label={`Добавить все треки из «${label || node.name}» и подпапок`}
+          >
+            {adding ? <span className="spin" /> : '+'}
+          </button>
+        )}
+      </div>
       {isOpen && (
         <div className="folder-body">
           {kids(node).map((c) => (
