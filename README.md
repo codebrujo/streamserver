@@ -138,6 +138,8 @@ Settings → Actions → General → «Approval for running fork pull request wo
 
 > Streamserver started and is listening on 0.0.0.0:8090, version 1.0.0 (3f2a1bc), videos: 628, music folders: 412
 
+Сообщение отправляется только после завершения сканирования видео и музыки (сколько бы оно ни длилось),
+до 3 попыток (сразу, через 15 с и через минуту); причина неудачи пишется в журнал.
 Если что-то не так (не смонтирован диск, нет ffmpeg), в конце добавляется `problems: …`.
 Настройки — `CHATGURU_URL`, `CHATGURU_TOKEN`, `CHATGURU_APP_TOKEN`, `CHATGURU_SERVICE_CHANNEL` (по умолчанию `ito`),
 те же значения, что в `.env` rag-server. Без `CHATGURU_URL` уведомление просто пропускается.
@@ -152,7 +154,12 @@ Settings → Actions → General → «Approval for running fork pull request wo
 - `GET /metrics` — формат Prometheus, только из LAN (через прокси — 404):
   `streamserver_up`, `streamserver_info{version,commit}`, `streamserver_uptime_seconds`,
   `streamserver_media_available{library}`, `streamserver_videos`, `streamserver_music_folders`,
-  `streamserver_transcodes_active{kind}`, `streamserver_transcodes_max{kind}`, `streamserver_cache_bytes`.
+  `streamserver_transcodes_active{kind}`, `streamserver_transcodes_max{kind}`, `streamserver_cache_bytes`,
+  `streamserver_event_loop_lag_max_seconds` (самое долгое «подвисание» Node с прошлого опроса; при > 2 с — предупреждение
+  в журнале: обычно это перегрузка Pi или своп).
+
+«ffmpeg не найден» ставится, только если бинарника действительно нет; если ffmpeg просто долго отвечал
+(Pi занят сразу после старта), проверка повторяется каждые 10 минут без ложной тревоги.
 
 ## Доступ извне через EC2
 

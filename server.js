@@ -198,11 +198,15 @@ app.post('/api/logout', (req, res) => {
 
 // ---------- operations: /health and /metrics (no login; details only for direct LAN requests) ----------
 const VERSION = await getVersion(__dirname);
-let ffmpegOk = true;
-checkFfmpeg().then((ok) => {
-  ffmpegOk = ok;
-  if (!ok) console.error('ffmpeg/ffprobe not found: transcoding and music conversion will fail');
-});
+// 'ok' | 'missing' | 'unknown' (did not answer in time) — re-checked every 10 minutes
+let ffmpegState = 'unknown';
+const recheckFfmpeg = () =>
+  checkFfmpeg().then((s) => {
+    if (s === 'missing' && ffmpegState !== 'missing') console.error('ffmpeg/ffprobe not found: transcoding and music conversion will fail');
+    if (s !== 'unknown' || ffmpegState !== 'ok') ffmpegState = s;
+  });
+recheckFfmpeg();
+setInterval(recheckFfmpeg, 10 * 60_000).unref();
 let musicRouter = null;
 const ops = createOps({
   mediaRoot: MEDIA_ROOT,
@@ -212,7 +216,7 @@ const ops = createOps({
   videoCount: () => (cache.data ? cache.data.length : null),
   musicFolders: () => (musicRouter ? musicRouter.stats().folders : null),
   transcodes: () => transcodeStatus(),
-  ffmpegOk: () => ffmpegOk,
+  ffmpegOk: () => ffmpegState !== 'missing',
 });
 ops.routes(app);
 
@@ -341,12 +345,13 @@ startCacheJanitor(CACHE_DIR, { maxAgeDays: Number(process.env.CACHE_MAX_AGE_DAYS
 
 app.listen(PORT, HOST, async () => {
   console.log(`home-cinema on http://${HOST}:${PORT}, media: ${MEDIA_ROOT}`);
-  // wait for the first scans (at most a minute) so the start message carries the library size
-  const timeout = new Promise((r) => setTimeout(() => r(null), 60_000));
+  // the start message goes out only after both library scans are finished, however long they take
+  const t0 = Date.now();
   const [videos, folders] = await Promise.all([
-    Promise.race([getLibrary().then((l) => l.length, () => null), timeout]),
-    musicRouter ? Promise.race([musicRouter.ready, timeout]) : null,
+    getLibrary().then((l) => l.length, () => null),
+    musicRouter ? musicRouter.ready : null,
   ]);
+  console.log(`library scans finished in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   if (videos != null) console.log(`indexed ${videos} videos`);
   const parts = [`Streamserver started and is listening on ${HOST}:${PORT}, version ${VERSION.label}`];
   parts.push(`videos: ${videos ?? 'scan failed'}`);
