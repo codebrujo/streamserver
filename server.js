@@ -8,6 +8,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { sendRange, decodeText } from './util.js';
 import { createMusicRouter } from './music.js';
+import { createPlaylistsRouter } from './playlists.js';
 import { startCacheJanitor } from './cache.js';
 import { createOps, getVersion, checkFfmpeg, notifyOnServerStart } from './ops.js';
 import { probe, plan, seekPoint, streamTranscode, transcodeStatus, shiftVtt, embeddedVtt } from './transcode.js';
@@ -24,6 +25,8 @@ const SESSION_DAYS = Number(process.env.SESSION_DAYS || 30);
 const SCAN_TTL_MS = 60_000;
 // optional: folder with music; enables the "Музыка" tab
 const MUSIC_ROOT = process.env.MUSIC_ROOT ? path.resolve(process.env.MUSIC_ROOT) : null;
+// app data that must survive deploys (playlists); not in git
+const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
 // probe results don't need it, but extracted embedded subtitles are cached here (put it on the SSD)
 const CACHE_DIR = path.resolve(process.env.CACHE_DIR || path.join(__dirname, 'cache'));
 
@@ -170,7 +173,8 @@ function fail(ip) {
 const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', 'loopback, uniquelocal'); // nginx on EC2 via WireGuard
-app.use(express.json({ limit: '10kb' }));
+// JSON bodies: small for login; playlists parse their own (bigger) bodies
+app.use('/api/login', express.json({ limit: '10kb' }));
 
 app.post('/api/login', (req, res) => {
   const ip = req.ip;
@@ -241,6 +245,7 @@ if (MUSIC_ROOT) {
       ecoBitrate: process.env.MUSIC_ECO_BITRATE || '192k',
     })),
   );
+  app.use('/api/playlists', createPlaylistsRouter({ dataDir: DATA_DIR, trackPath: musicRouter.trackPath }));
 }
 
 app.get('/api/videos', async (req, res) => {

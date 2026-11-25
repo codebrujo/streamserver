@@ -8,7 +8,7 @@ export const useMusic = () => useContext(Ctx);
 const STATE_KEY = 'cinema.music';
 // at home stream lossless as-is; elsewhere save mobile data and EC2 traffic
 const IS_LAN = /^(localhost$|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(location.hostname);
-const coverUrl = (folder, s = 300) => `/api/music/cover?path=${encodeURIComponent(folder)}&s=${s}`;
+export const coverUrl = (folder, s = 300) => `/api/music/cover?path=${encodeURIComponent(folder)}&s=${s}`;
 const shuffled = (n, first) => {
   const rest = [...Array(n).keys()].filter((i) => i !== first);
   for (let i = rest.length - 1; i > 0; i--) {
@@ -153,7 +153,7 @@ export function MusicProvider({ enabled, children }) {
   }, []);
 
   const playQueue = useCallback((tracks, start, folder) => {
-    const q = tracks.map((t) => ({ ...t, folder }));
+    const q = tracks.map((t) => ({ ...t, folder: folder ?? t.folder }));
     const o = shuffle ? shuffled(q.length, start) : [...q.keys()];
     autoplay.current = true;
     resumeAt.current = 0;
@@ -262,9 +262,20 @@ export function MiniPlayer() {
 // ================= library =================
 let treeCache = null;
 const folderCache = new Map();
+
+// shared with the playlist editor
+export async function getMusicTree(refresh) {
+  if (treeCache && !refresh) return treeCache;
+  treeCache = await api('/api/music/tree' + (refresh ? '?refresh=1' : ''));
+  return treeCache;
+}
+export async function getFolder(path) {
+  if (!folderCache.has(path)) folderCache.set(path, await api(`/api/music/folder?path=${encodeURIComponent(path)}`));
+  return folderCache.get(path);
+}
 const OPEN_KEY = 'cinema.music.open';
 
-function buildTree(folders) {
+export function buildTree(folders) {
   const root = { name: '', path: '', children: new Map(), own: null, count: 0 };
   for (const f of folders) {
     let node = root;
@@ -282,9 +293,9 @@ function buildTree(folders) {
   }
   return root;
 }
-const kids = (n) => [...n.children.values()].sort((a, b) => natural(a.name, b.name));
+export const kids = (n) => [...n.children.values()].sort((a, b) => natural(a.name, b.name));
 
-const Chevron = () => (
+export const Chevron = () => (
   <svg className="chev" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
     <path d="M6 3l5 5-5 5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
   </svg>

@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 
 import { api, fmtSize, fmtTime } from './lib.js';
 import { MusicProvider, MusicLibrary, MiniPlayer } from './Music.jsx';
+import { PlaylistsPage } from './Playlists.jsx';
 
 // watch progress lives in localStorage (per browser)
 const PROGRESS_KEY = 'cinema.progress';
@@ -551,10 +552,12 @@ export default function App() {
   if (state === 'error') return <p className="err">Ошибка: {err}</p>;
 
   const isMusic = hash.startsWith('#/music');
+  const isPlaylists = hash.startsWith('#/playlists');
   const tabs = music ? (
     <nav className="tabs">
-      <a className={isMusic ? '' : 'on'} href="#/">🎬 Кино</a>
+      <a className={isMusic || isPlaylists ? '' : 'on'} href="#/">🎬 Кино</a>
       <a className={isMusic ? 'on' : ''} href="#/music">🎵 Музыка</a>
+      <a className={isPlaylists ? 'on' : ''} href="#/playlists">📃 Плейлисты</a>
     </nav>
   ) : <h1>🎬 Кинотеатр</h1>;
 
@@ -563,6 +566,10 @@ export default function App() {
   const v = m && videos.find((x) => x.id === m[1]);
   if (v) page = <Player v={v} list={videos} />;
   else if (isMusic && music) page = <MusicLibrary tabs={tabs} onLogout={logout} />;
+  else if (isPlaylists && music) {
+    const pm = hash.match(/^#\/playlists\/([\w-]+)\/edit$/);
+    page = <PlaylistsPage key={pm ? pm[1] : 'list'} tabs={tabs} onLogout={logout} editId={pm ? pm[1] : null} />;
+  }
   else page = <Library videos={videos} onRefresh={() => load(true)} onLogout={logout} tabs={tabs} />;
 
   return (
