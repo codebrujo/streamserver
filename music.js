@@ -457,6 +457,13 @@ export function createMusicRouter({ root, cacheDir, cacheLimitMb = 2048, ecoBitr
   });
 
   router.stats = () => ({ folders: tree.data ? tree.data.length : null });
+  // for playlists: absolute path of a track id inside MUSIC_ROOT, or null if the id is invalid
+  router.trackPath = (id) => {
+    const t = fromId(id);
+    if (!t || typeof t.f !== 'string') return null;
+    const abs = resolveRel(t.f);
+    return abs && AUDIO_EXT.has(ext(abs)) ? abs : null;
+  };
   router.ready = getTree()
     .then((t) => {
       console.log(`music: ${t.length} folders in ${ROOT}`);
