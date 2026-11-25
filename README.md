@@ -31,6 +31,11 @@
 
 Нужен ffmpeg: `sudo apt install ffmpeg`.
 
+Одновременных потоков через ffmpeg — отдельно по «тяжести»: `MAX_AUDIO_TRANSCODES` (видео копируется,
+перекодируется только звук; по умолчанию 6) и `MAX_VIDEO_TRANSCODES` (перекодирование видео; по умолчанию 2,
+старое `MAX_TRANSCODES` тоже понимается). Перемотка не занимает второй слот: прежний поток зрителя закрывается сразу.
+Если слоты заняты, плеер так и пишет. Текущая загрузка: `GET /api/status`.
+
 Ограничения: у Pi 5 нет аппаратного кодировщика, перекодирование видео — программное (libx264).
 На iPhone/Safari режимы с ffmpeg могут не работать (Safari требует Range-запросы); Android и десктопные браузеры — ок.
 
@@ -127,6 +132,7 @@ npm run dev:web    # UI с hot reload на :5173, /api проксируется 
 | GET | `/api/music/prepare/:id?q=` | подготовить трек заранее |
 | GET | `/api/music/cover?path=&s=` | обложка JPEG |
 | GET | `/api/probe/:id` | кодеки, дорожки, длительность, режим |
+| GET | `/api/status` | занятые/доступные слоты перекодирования |
 | GET | `/api/seekpoint/:id?t=&audio=` | точка старта потока (ключевой кадр) |
 | GET | `/api/transcode/:id?start=&ss=&audio=` | поток через ffmpeg (fMP4) |
 | GET | `/api/subtitle-embedded/:id/:n?offset=` | встроенные субтитры в WebVTT |

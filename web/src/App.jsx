@@ -367,9 +367,18 @@ function Player({ v, list }) {
       saveProgress(v.id, duration, duration);
       if (next) location.hash = `#/watch/${next.id}`;
     };
-    const onErr = () => {
-      if (streamMode) return recover('error ' + (el.error?.code ?? ''));
-      setError('Браузер не смог воспроизвести файл.');
+    const onErr = async () => {
+      if (!streamMode) return setError('Браузер не смог воспроизвести файл.');
+      // all slots taken by other viewers: say so instead of hammering the server with retries
+      const st = await api('/api/status').catch(() => null);
+      const slot = st?.transcodes?.[mode];
+      if (slot && slot.active >= slot.max) {
+        clearTimeout(watchdog.current);
+        setNotice('');
+        setError(`Сейчас заняты все потоки перекодирования (${slot.active} из ${slot.max}) — их смотрят другие. Попробуйте чуть позже.`);
+        return;
+      }
+      recover('error ' + (el.error?.code ?? ''));
     };
     const evs = { loadedmetadata: onMeta, timeupdate: onTime, play: onPlay, pause: onPause, waiting: onWait, playing: onPlaying, ended: onEnded, error: onErr };
     for (const [k, f] of Object.entries(evs)) el.addEventListener(k, f);

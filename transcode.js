@@ -7,7 +7,12 @@ import { touch } from './cache.js';
 
 const FFMPEG = process.env.FFMPEG || 'ffmpeg';
 const FFPROBE = process.env.FFPROBE || 'ffprobe';
-const MAX_TRANSCODES = Number(process.env.MAX_TRANSCODES || 2);
+// Separate limits by cost. 'audio' streams copy the video and only encode AAC (a few % of a core each);
+// 'video' streams run libx264 (SD: ~1 core, 1080p: the whole Pi). MAX_TRANSCODES is the old single knob.
+const LIMITS = {
+  video: Number(process.env.MAX_VIDEO_TRANSCODES || process.env.MAX_TRANSCODES || 2),
+  audio: Number(process.env.MAX_AUDIO_TRANSCODES || 6),
+};
 const X264_PRESET = process.env.X264_PRESET || 'veryfast';
 const AUDIO_BITRATE = process.env.AUDIO_BITRATE || '192k';
 
@@ -136,9 +141,14 @@ export async function seekPoint(file, info, t, audioIdx) {
 }
 
 // ---------- streaming transcode ----------
-let active = 0;
+const active = { video: 0, audio: 0 };
 // one live stream per viewer session: a new request (seek, audio switch, reconnect) replaces the old one
 const bySession = new Map();
+
+export const transcodeStatus = () => ({
+  video: { active: active.video, max: LIMITS.video },
+  audio: { active: active.audio, max: LIMITS.audio },
+});
 
 export function streamTranscode(req, res, file, info, { ss = 0, audio = 0, session = '' } = {}) {
   // The output is generated on the fly and can't be resumed at a byte offset. Browsers send
@@ -149,13 +159,19 @@ export function streamTranscode(req, res, file, info, { ss = 0, audio = 0, sessi
     res.setHeader('Content-Range', 'bytes */*');
     return res.sendStatus(416);
   }
+  // free the viewer's previous stream *now*, so a seek never bumps into its own slot
   const prev = session && bySession.get(session);
-  if (prev) prev.destroy(); // frees its ffmpeg via the 'close' handler below
-
-  if (active >= MAX_TRANSCODES) {
-    return res.status(503).json({ error: 'Too many simultaneous streams, try again in a moment' });
+  if (prev) {
+    prev.release();
+    prev.res.destroy();
   }
+
   const p = plan(file, info, audio);
+  const kind = p.copyVideo ? 'audio' : 'video';
+  if (active[kind] >= LIMITS[kind]) {
+    console.warn(`stream refused: ${active[kind]}/${LIMITS[kind]} ${kind} transcodes busy`);
+    return res.status(503).json({ error: `All ${LIMITS[kind]} ${kind} transcoding slots are busy, try again later` });
+  }
   const ext = path.extname(file).toLowerCase();
 
   const args = ['-hide_banner', '-loglevel', 'error', '-nostdin'];
@@ -181,8 +197,16 @@ export function streamTranscode(req, res, file, info, { ss = 0, audio = 0, sessi
   args.push('-avoid_negative_ts', 'make_zero', '-movflags', 'frag_keyframe+empty_moov+default_base_moof', '-f', 'mp4', 'pipe:1');
 
   const ff = spawn(FFMPEG, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-  active++;
-  if (session) bySession.set(session, res);
+  active[kind]++;
+  let exited = false;
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    active[kind]--;
+    if (!exited) ff.kill('SIGKILL');
+  };
+  if (session) bySession.set(session, { res, release });
   const t0 = Date.now();
   let bytes = 0;
   ff.stdout.on('data', (d) => (bytes += d.length));
@@ -190,20 +214,16 @@ export function streamTranscode(req, res, file, info, { ss = 0, audio = 0, sessi
   ff.stderr.on('data', (d) => {
     if (stderr.length < 4000) stderr += d;
   });
-  let finished = false;
-  const done = () => {
-    if (finished) return;
-    finished = true;
-    active--;
-  };
   ff.on('error', (e) => {
-    done();
+    exited = true;
+    release();
     console.error('ffmpeg spawn failed:', e.message);
     if (!res.headersSent) res.status(500).json({ error: 'ffmpeg not available' });
     else res.destroy();
   });
   ff.on('close', (code, signal) => {
-    done();
+    exited = true;
+    release();
     if (code && !signal && stderr) console.error(`ffmpeg exited ${code} for ${path.basename(file)}:`, stderr.trim().slice(0, 500));
   });
 
@@ -214,8 +234,8 @@ export function streamTranscode(req, res, file, info, { ss = 0, audio = 0, sessi
   ff.stdout.pipe(res);
   // viewer closed the tab or seeked -> stop ffmpeg right away
   res.on('close', () => {
-    if (session && bySession.get(session) === res) bySession.delete(session);
-    if (!finished) ff.kill('SIGKILL');
+    if (session && bySession.get(session)?.res === res) bySession.delete(session);
+    release();
     console.log(`stream ${path.basename(file)} @${ss.toFixed(0)}s [${p.mode}] closed after ${((Date.now() - t0) / 1000).toFixed(0)}s, ${(bytes / 1e6).toFixed(1)} MB`);
   });
 }
