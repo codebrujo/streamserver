@@ -1,0 +1,30 @@
+name: Deploy to mediaserver
+
+# После merge в main (и вручную из вкладки Actions) обновляет streamserver на mediaserver.
+# Выполняется на self-hosted runner'е, установленном на самом Pi (см. README, «Автодеплой»).
+# Вся логика — в deploy.sh: тот же скрипт можно запустить на сервере руками.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Два деплоя одновременно не запускаются: следующий ждёт окончания предыдущего
+concurrency:
+  group: deploy-mediaserver
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  DEPLOY_DIR: /srv/storage/apps/streamserver
+
+jobs:
+  deploy:
+    # форки не должны пытаться попасть на runner в домашней сети
+    if: github.repository == 'codebrujo/streamserver'
+    runs-on: [self-hosted, ARM64, streamserver]
+    timeout-minutes: 15
+    steps:
+      - name: Deploy (git pull, npm ci, build, restart, /health)
+        run: '"$DEPLOY_DIR/deploy.sh"'

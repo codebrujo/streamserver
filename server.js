@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { sendRange, decodeText } from './util.js';
 import { createMusicRouter } from './music.js';
 import { startCacheJanitor } from './cache.js';
+import { createOps, getVersion, checkFfmpeg, notifyOnServerStart } from './ops.js';
 import { probe, plan, seekPoint, streamTranscode, transcodeStatus, shiftVtt, embeddedVtt } from './transcode.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -195,6 +196,26 @@ app.post('/api/logout', (req, res) => {
   res.json({ ok: true });
 });
 
+// ---------- operations: /health and /metrics (no login; details only for direct LAN requests) ----------
+const VERSION = await getVersion(__dirname);
+let ffmpegOk = true;
+checkFfmpeg().then((ok) => {
+  ffmpegOk = ok;
+  if (!ok) console.error('ffmpeg/ffprobe not found: transcoding and music conversion will fail');
+});
+let musicRouter = null;
+const ops = createOps({
+  mediaRoot: MEDIA_ROOT,
+  musicRoot: MUSIC_ROOT,
+  cacheDir: CACHE_DIR,
+  version: VERSION,
+  videoCount: () => (cache.data ? cache.data.length : null),
+  musicFolders: () => (musicRouter ? musicRouter.stats().folders : null),
+  transcodes: () => transcodeStatus(),
+  ffmpegOk: () => ffmpegOk,
+});
+ops.routes(app);
+
 // everything else under /api requires a session
 app.use('/api', (req, res, next) => {
   if (validToken(getCookie(req, 'cinema'))) return next();
@@ -209,12 +230,12 @@ app.get('/api/status', (req, res) => res.json({ transcodes: transcodeStatus() })
 if (MUSIC_ROOT) {
   app.use(
     '/api/music',
-    createMusicRouter({
+    (musicRouter = createMusicRouter({
       root: MUSIC_ROOT,
       cacheDir: CACHE_DIR,
       cacheLimitMb: Number(process.env.MUSIC_CACHE_MB || 2048),
       ecoBitrate: process.env.MUSIC_ECO_BITRATE || '192k',
-    }),
+    })),
   );
 }
 
@@ -318,7 +339,19 @@ app.get('*', (req, res, next) => {
 
 startCacheJanitor(CACHE_DIR, { maxAgeDays: Number(process.env.CACHE_MAX_AGE_DAYS || 90) });
 
-app.listen(PORT, HOST, () => {
+app.listen(PORT, HOST, async () => {
   console.log(`home-cinema on http://${HOST}:${PORT}, media: ${MEDIA_ROOT}`);
-  getLibrary().then((l) => console.log(`indexed ${l.length} videos`));
+  // wait for the first scans (at most a minute) so the start message carries the library size
+  const timeout = new Promise((r) => setTimeout(() => r(null), 60_000));
+  const [videos, folders] = await Promise.all([
+    Promise.race([getLibrary().then((l) => l.length, () => null), timeout]),
+    musicRouter ? Promise.race([musicRouter.ready, timeout]) : null,
+  ]);
+  if (videos != null) console.log(`indexed ${videos} videos`);
+  const parts = [`Streamserver started and is listening on ${HOST}:${PORT}, version ${VERSION.label}`];
+  parts.push(`videos: ${videos ?? 'scan failed'}`);
+  if (musicRouter) parts.push(`music folders: ${folders ?? 'scan failed'}`);
+  const h = await ops.health();
+  if (h.problems.length) parts.push(`problems: ${h.problems.join('; ')}`);
+  notifyOnServerStart(parts.join(', '));
 });

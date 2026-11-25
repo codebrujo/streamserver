@@ -90,14 +90,69 @@ CUE-образы (один FLAC/APE на альбом + `.cue`) показыва
 7. `sudo cp deploy/home-cinema.service /etc/systemd/system/` (поправьте `User=` при необходимости).
 8. `sudo systemctl enable --now home-cinema`
 
-## Обновление
+## Обновление и автодеплой
+
+Каждый merge в `main` автоматически выкатывается на mediaserver: `.github/workflows/deploy.yml` запускается
+на self-hosted runner'е на самом Pi и вызывает `deploy.sh`. Тот же скрипт можно запустить руками:
 
 ```bash
 /srv/storage/apps/streamserver/deploy.sh
 ```
 
-Скрипт делает `git pull`, при изменении зависимостей — `npm install`, собирает UI, перезапускает службу
-и показывает, какие коммиты приехали. Если служба не поднялась — выводит последние строки журнала.
+`deploy.sh`: `git pull --ff-only` → `npm ci`, если менялись зависимости → сборка UI во временную папку
+и подмена (неудачная сборка не ломает работающий UI) → `sudo systemctl restart streamserver` → проверка `/health`.
+Если `/health` отвечает 503 (например, не смонтирован USB-диск), деплой проходит с предупреждением;
+если служба не ответила за 30 с — деплой падает и показывает журнал. Вручную деплой запускается и из вкладки
+Actions (`workflow_dispatch`).
+
+### Установка runner'а (один раз)
+
+Runner регистрируется на этот репозиторий отдельно от runner'ов rag-server и бота.
+GitHub → Settings → Actions → Runners → New self-hosted runner → Linux / ARM64 — там же актуальные команды
+скачивания и токен. На mediaserver:
+
+```bash
+mkdir -p /srv/storage/apps/actions-runner-streamserver && cd /srv/storage/apps/actions-runner-streamserver
+# скачать и распаковать архив runner'а (команды со страницы GitHub), затем:
+./config.sh --url https://github.com/codebrujo/streamserver --token <ТОКЕН> \
+  --name mediaserver-streamserver --labels streamserver --unattended
+sudo ./svc.sh install pi && sudo ./svc.sh start
+```
+
+Runner работает от `pi`, которому нужно право только на перезапуск службы:
+
+```text
+# /etc/sudoers.d/streamserver-deploy
+pi ALL=(root) NOPASSWD: /usr/bin/systemctl restart streamserver
+```
+
+⚠️ Репозиторий публичный. Чтобы чужой PR из форка не мог запустить свой workflow на runner'е в домашней сети:
+Settings → Actions → General → «Approval for running fork pull request workflows» →
+**Require approval for all external contributors**. Сам `deploy.yml` срабатывает только на push в `main`
+этого репозитория.
+
+## Уведомление о старте
+
+При каждом запуске (в том числе после автодеплоя) сервер пишет в служебный канал chatguru —
+так же, как rag-server и aikrishna:
+
+> Streamserver started and is listening on 0.0.0.0:8090, version 1.0.0 (3f2a1bc), videos: 628, music folders: 412
+
+Если что-то не так (не смонтирован диск, нет ffmpeg), в конце добавляется `problems: …`.
+Настройки — `CHATGURU_URL`, `CHATGURU_TOKEN`, `CHATGURU_APP_TOKEN`, `CHATGURU_SERVICE_CHANNEL` (по умолчанию `ito`),
+те же значения, что в `.env` rag-server. Без `CHATGURU_URL` уведомление просто пропускается.
+
+## Мониторинг
+
+Без логина, для monitoring-mcp-bot и Prometheus:
+
+- `GET /health` — `200 {"status":"ok", …}` или `503 {"status":"degraded","problems":[…]}`, если недоступна папка
+  с видео/музыкой (USB-диск отвалился) или нет ffmpeg. Подробности (версия, число видео, загрузка перекодирования)
+  отдаются только прямым запросам из LAN; через nginx на EC2 — только `status`.
+- `GET /metrics` — формат Prometheus, только из LAN (через прокси — 404):
+  `streamserver_up`, `streamserver_info{version,commit}`, `streamserver_uptime_seconds`,
+  `streamserver_media_available{library}`, `streamserver_videos`, `streamserver_music_folders`,
+  `streamserver_transcodes_active{kind}`, `streamserver_transcodes_max{kind}`, `streamserver_cache_bytes`.
 
 ## Доступ извне через EC2
 
@@ -132,6 +187,8 @@ npm run dev:web    # UI с hot reload на :5173, /api проксируется 
 | GET | `/api/music/prepare/:id?q=` | подготовить трек заранее |
 | GET | `/api/music/cover?path=&s=` | обложка JPEG |
 | GET | `/api/probe/:id` | кодеки, дорожки, длительность, режим |
+| GET | `/health` | без логина: `ok` / `degraded` (503) |
+| GET | `/metrics` | без логина, только из LAN: метрики Prometheus |
 | GET | `/api/status` | занятые/доступные слоты перекодирования |
 | GET | `/api/seekpoint/:id?t=&audio=` | точка старта потока (ключевой кадр) |
 | GET | `/api/transcode/:id?start=&ss=&audio=` | поток через ffmpeg (fMP4) |
