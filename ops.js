@@ -2,6 +2,7 @@
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
+import { monitorEventLoopDelay } from 'node:perf_hooks';
 
 const startedAt = Date.now();
 
@@ -20,10 +21,35 @@ export async function getVersion(appDir) {
   return { version, commit: commit || '' , label: commit ? `${version} (${commit})` : version };
 }
 
-export async function checkFfmpeg() {
-  const [ff, fp] = await Promise.all([run(process.env.FFMPEG || 'ffmpeg', ['-version']), run(process.env.FFPROBE || 'ffprobe', ['-version'])]);
-  return !!ff && !!fp;
+// 'missing' only when the binary really isn't there (ENOENT). A slow answer right after start (the Pi busy
+// scanning the library) is 'unknown' and is checked again later instead of raising a false alarm.
+function probeBinary(cmd) {
+  return new Promise((resolve) => {
+    execFile(cmd, ['-version'], { timeout: 30_000 }, (err) => {
+      if (!err) return resolve('ok');
+      resolve(err.code === 'ENOENT' ? 'missing' : 'unknown');
+    });
+  });
 }
+export async function checkFfmpeg() {
+  const r = await Promise.all([probeBinary(process.env.FFMPEG || 'ffmpeg'), probeBinary(process.env.FFPROBE || 'ffprobe')]);
+  return r.includes('missing') ? 'missing' : r.includes('unknown') ? 'unknown' : 'ok';
+}
+
+// ---------- event loop lag: if Node stalls (swap, I/O starvation), timeouts fire for no real reason ----------
+const loopDelay = monitorEventLoopDelay({ resolution: 50 });
+loopDelay.enable();
+let lagMaxSec = 0; // worst stall since the last scrape of /metrics
+let lastWarn = 0;
+setInterval(() => {
+  const maxSec = loopDelay.max / 1e9;
+  loopDelay.reset();
+  lagMaxSec = Math.max(lagMaxSec, maxSec);
+  if (maxSec > 2 && Date.now() - lastWarn > 60_000) {
+    lastWarn = Date.now();
+    console.warn(`event loop stalled for ${maxSec.toFixed(1)}s (system overloaded or swapping?)`);
+  }
+}, 5_000).unref();
 
 // Only answer details to direct LAN requests (monitoring), not to the internet via the EC2 proxy.
 export function isDirectLan(req) {
@@ -109,6 +135,8 @@ export function createOps(deps) {
       ['{kind="video"}', t.video.max],
     ]);
     metric('streamserver_cache_bytes', 'Size of the cache directory', 'gauge', [['', await getCacheBytes()]]);
+    metric('streamserver_event_loop_lag_max_seconds', 'Longest event loop stall since the previous scrape', 'gauge', [['', lagMaxSec.toFixed(3)]]);
+    lagMaxSec = 0;
     return lines.join('\n') + '\n';
   }
 
@@ -130,12 +158,28 @@ export function createOps(deps) {
 }
 
 // Same message format and API as rag-server / aikrishna: POST {CHATGURU_URL}message to the service channel.
+// Retries: right after a restart the Pi is busy and the first attempt may time out.
+const RETRY_DELAYS = [0, 15_000, 60_000];
 export async function notifyOnServerStart(text) {
   console.log(text);
   const base = process.env.CHATGURU_URL;
   if (!base) return console.log('CHATGURU_URL is not set, start notification skipped');
+  for (let i = 0; i < RETRY_DELAYS.length; i++) {
+    if (RETRY_DELAYS[i]) await new Promise((r) => setTimeout(r, RETRY_DELAYS[i]));
+    const err = await sendToChatguru(base, text);
+    if (!err) {
+      if (i) console.log(`start notification sent (attempt ${i + 1})`);
+      return;
+    }
+    console.error(`start notification failed (attempt ${i + 1}/${RETRY_DELAYS.length}): ${err}`);
+  }
+}
+
+// returns null on success, otherwise an error description
+async function sendToChatguru(base, text) {
   const url = (base.endsWith('/') ? base : base + '/') + 'message';
   const channelId = process.env.CHATGURU_SERVICE_CHANNEL || 'ito';
+  const started = Date.now();
   try {
     const res = await fetch(url, {
       method: 'POST',
@@ -145,11 +189,14 @@ export async function notifyOnServerStart(text) {
         'x-app-s2s-token': process.env.CHATGURU_TOKEN || '',
       },
       body: JSON.stringify({ channelId, messages: [{ text, timestamp: new Date().toISOString() }] }),
-      signal: AbortSignal.timeout(10_000),
+      signal: AbortSignal.timeout(30_000),
     });
     const body = await res.json().catch(() => ({}));
-    if (!res.ok || body?.error) console.error(`start notification failed: HTTP ${res.status} ${JSON.stringify(body).slice(0, 300)}`);
+    if (!res.ok || body?.error) return `HTTP ${res.status} ${JSON.stringify(body).slice(0, 300)}`;
+    return null;
   } catch (e) {
-    console.error(`start notification failed: ${e.message}`);
+    // undici hides the real reason (DNS, refused, TLS, timeout) in e.cause
+    const cause = e.cause ? ` (${e.cause.code || ''} ${e.cause.message || ''})`.replace('( ', '(') : '';
+    return `${e.name}: ${e.message}${cause} after ${((Date.now() - started) / 1000).toFixed(1)}s`;
   }
 }
