@@ -212,6 +212,7 @@ const recheckFfmpeg = () =>
 recheckFfmpeg();
 setInterval(recheckFfmpeg, 10 * 60_000).unref();
 let musicRouter = null;
+let playlistsRouter = null;
 const ops = createOps({
   mediaRoot: MEDIA_ROOT,
   musicRoot: MUSIC_ROOT,
@@ -245,7 +246,7 @@ if (MUSIC_ROOT) {
       ecoBitrate: process.env.MUSIC_ECO_BITRATE || '192k',
     })),
   );
-  app.use('/api/playlists', createPlaylistsRouter({ dataDir: DATA_DIR, trackPath: musicRouter.trackPath }));
+  app.use('/api/playlists', (playlistsRouter = createPlaylistsRouter({ dataDir: DATA_DIR, trackPath: musicRouter.trackPath })));
 }
 
 app.get('/api/videos', async (req, res) => {
@@ -352,15 +353,17 @@ app.listen(PORT, HOST, async () => {
   console.log(`home-cinema on http://${HOST}:${PORT}, media: ${MEDIA_ROOT}`);
   // the start message goes out only after both library scans are finished, however long they take
   const t0 = Date.now();
-  const [videos, folders] = await Promise.all([
+  const [videos, folders, playlists] = await Promise.all([
     getLibrary().then((l) => l.length, () => null),
     musicRouter ? musicRouter.ready : null,
+    playlistsRouter ? playlistsRouter.ready : null,
   ]);
   console.log(`library scans finished in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   if (videos != null) console.log(`indexed ${videos} videos`);
   const parts = [`Streamserver started and is listening on ${HOST}:${PORT}, version ${VERSION.label}`];
   parts.push(`videos: ${videos ?? 'scan failed'}`);
   if (musicRouter) parts.push(`music folders: ${folders ?? 'scan failed'}`);
+  if (playlistsRouter) parts.push(`playlists: ${playlists ?? 'read failed'}`);
   const h = await ops.health();
   if (h.problems.length) parts.push(`problems: ${h.problems.join('; ')}`);
   notifyOnServerStart(parts.join(', '));
