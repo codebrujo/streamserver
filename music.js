@@ -280,6 +280,33 @@ export function createMusicRouter({ root, cacheDir, cacheLimitMb = 2048, ecoBitr
     }
   });
 
+  // Every track of a folder and all its subfolders, in tree order (for "+" in the playlist editor).
+  // Folders are read one after another: reading tags of many files at once would swamp the USB drive.
+  const DEEP_LIMIT = 5000;
+  router.get('/folder-deep', async (req, res) => {
+    const rel = String(req.query.path || '');
+    if (!resolveRel(rel)) return res.sendStatus(404);
+    try {
+      const all = await getTree();
+      const inside = all.filter((f) => !rel || f.path === rel || f.path.startsWith(rel + '/'));
+      const tracks = [];
+      let truncated = false;
+      for (const f of inside) {
+        const data = await readFolder(f.path).catch(() => null);
+        if (!data) continue;
+        for (const t of data.tracks) {
+          if (tracks.length >= DEEP_LIMIT) { truncated = true; break; }
+          tracks.push({ ...t, folder: f.path });
+        }
+        if (truncated) break;
+      }
+      res.json({ path: rel, folders: inside.length, tracks, truncated });
+    } catch (e) {
+      console.error('folder-deep failed:', e.message);
+      res.sendStatus(500);
+    }
+  });
+
   // ----- playback -----
   // Decide what to send: the original file, or a cached transcode (FLAC = lossless, M4A/AAC = compact).
   function target(t, q) {
