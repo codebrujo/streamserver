@@ -309,6 +309,7 @@ function PickFolder({ node, label, open, toggle, selected, setInPlaylist }) {
 }
 
 function PickTracks({ path, selected, setInPlaylist }) {
+  const m = useMusic();
   const [data, setData] = useState(null);
   const [err, setErr] = useState('');
   useEffect(() => { getFolder(path).then(setData).catch(() => setErr('Не удалось прочитать папку')); }, [path]);
@@ -327,15 +328,29 @@ function PickTracks({ path, selected, setInPlaylist }) {
         <span className="rtitle">Все треки папки</span>
         <span className="rmeta">{nSel}/{tracks.length}</span>
       </label>
-      {tracks.map((t, i) => (
-        <label key={t.id} className={'row check' + (selected.has(t.id) ? ' on' : '')}>
-          <input type="checkbox" checked={selected.has(t.id)} onChange={(e) => setInPlaylist([t], e.target.checked)} />
-          <span className="tn">{t.n || i + 1}</span>
-          <span className="rtitle">{t.title}{t.artist && <small> — {t.artist}</small>}</span>
-          {t.quality && <span className="fmt">{t.quality}</span>}
-          <span className="rmeta">{fmtTime(t.duration)}</span>
-        </label>
-      ))}
+      {tracks.map((t, i) => {
+        const isCur = m.current?.id === t.id;
+        return (
+          <div key={t.id} className={'row check' + (selected.has(t.id) ? ' on' : '') + (isCur ? ' cur' : '')}>
+            <label className="pick-main">
+              <input type="checkbox" checked={selected.has(t.id)} onChange={(e) => setInPlaylist([t], e.target.checked)} />
+              <span className="tn">{isCur && m.playing ? '♪' : t.n || i + 1}</span>
+              <span className="rtitle">{t.title}{t.artist && <small> — {t.artist}</small>}</span>
+              {t.quality && <span className="fmt">{t.quality}</span>}
+              <span className="rmeta">{fmtTime(t.duration)}</span>
+            </label>
+            {/* listen before adding: plays this folder from the track in the mini player; the playlist is not changed */}
+            <button
+              className="icon play"
+              onClick={() => (isCur ? m.toggle() : m.playQueue(tracks, i, path))}
+              title={isCur && m.playing ? 'Пауза' : 'Прослушать'}
+              aria-label={`${isCur && m.playing ? 'Пауза' : 'Прослушать'}: ${t.title}`}
+            >
+              {isCur && m.playing ? '❚❚' : '▶'}
+            </button>
+          </div>
+        );
+      })}
     </div>
   );
 }
