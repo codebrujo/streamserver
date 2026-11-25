@@ -25,6 +25,8 @@ export function MusicProvider({ enabled, children }) {
   const [order, setOrder] = useState(saved.order || []);
   const [pos, setPos] = useState(saved.pos || 0);
   const [shuffle, setShuffle] = useState(!!saved.shuffle);
+  // playlist play order 'loop': after the last track start over; otherwise stop at the end
+  const [loop, setLoop] = useState(!!saved.loop);
   const [quality, setQualityState] = useState(saved.quality || (IS_LAN ? 'orig' : 'eco'));
   const [playing, setPlaying] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -38,13 +40,14 @@ export function MusicProvider({ enabled, children }) {
   const prefetched = useRef('');
 
   const current = queue[order[pos]] || null;
-  const nextTrack = queue[order[pos + 1]] || null;
+  const nextPos = pos + 1 < order.length ? pos + 1 : loop && order.length ? 0 : -1;
+  const nextTrack = nextPos >= 0 ? queue[order[nextPos]] || null : null;
   const src = current ? `/api/music/stream/${current.id}?q=${quality}` : '';
 
   // persist (without the time, which is saved separately and more often)
   useEffect(() => {
-    lsSet(STATE_KEY, { ...lsGet(STATE_KEY, {}), queue: queue.slice(0, 500), order: order.slice(0, 500), pos, shuffle, quality });
-  }, [queue, order, pos, shuffle, quality]);
+    lsSet(STATE_KEY, { ...lsGet(STATE_KEY, {}), queue: queue.slice(0, 500), order: order.slice(0, 500), pos, shuffle, quality, loop });
+  }, [queue, order, pos, shuffle, quality, loop]);
 
   const go = useCallback((p) => {
     if (p < 0 || p >= order.length) return;
@@ -52,12 +55,23 @@ export function MusicProvider({ enabled, children }) {
     resumeAt.current = 0;
     setPos(p);
   }, [order.length]);
-  const next = useCallback(() => go(pos + 1), [go, pos]);
+  const next = useCallback(() => {
+    if (nextPos < 0) return; // linear: the queue is over, stay stopped on the last track
+    if (nextPos === pos) {
+      // looping a single track: same position, so just start it again
+      const a = audio.current;
+      a.currentTime = 0;
+      a.play().catch(() => {});
+      return;
+    }
+    go(nextPos);
+  }, [go, pos, nextPos]);
   const prev = useCallback(() => {
     const a = audio.current;
     if (a && a.currentTime > 3) a.currentTime = 0;
+    else if (pos === 0 && loop) go(order.length - 1);
     else go(pos - 1);
-  }, [go, pos]);
+  }, [go, pos, loop, order.length]);
 
   // load the current track
   useEffect(() => {
@@ -152,8 +166,9 @@ export function MusicProvider({ enabled, children }) {
     return () => removeEventListener('cinema:video', stop);
   }, []);
 
-  const playQueue = useCallback((tracks, start, folder) => {
+  const playQueue = useCallback((tracks, start, folder, opts = {}) => {
     const q = tracks.map((t) => ({ ...t, folder: folder ?? t.folder }));
+    setLoop(!!opts.loop);
     const o = shuffle ? shuffled(q.length, start) : [...q.keys()];
     autoplay.current = true;
     resumeAt.current = 0;
@@ -188,7 +203,7 @@ export function MusicProvider({ enabled, children }) {
 
   const value = {
     enabled, current, queue, order, pos, playing, loading, time, dur, error, shuffle, quality,
-    playQueue, toggle, next, prev, seek, toggleShuffle, setQuality, hasNext: !!nextTrack,
+    playQueue, toggle, next, prev, seek, toggleShuffle, setQuality, hasNext: !!nextTrack, loop,
   };
   return (
     <Ctx.Provider value={value}>
@@ -246,6 +261,7 @@ export function MiniPlayer() {
           </span>
         )}
         {m.error && <span className="merr">{m.error}</span>}
+        {m.loop && <span className="chip on loopmark" title="Плейлист по кругу: после последнего трека начнётся сначала">🔁</span>}
         <button className={'chip' + (m.shuffle ? ' on' : '')} onClick={m.toggleShuffle} title="Перемешать" aria-label="Перемешать" aria-pressed={m.shuffle}>🔀</button>
         <button
           className="chip"
