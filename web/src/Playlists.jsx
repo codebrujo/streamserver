@@ -48,7 +48,7 @@ function PlaylistList({ tabs, onLogout }) {
   const playAll = async (id, start = 0) => {
     const d = await getDetails(id);
     const tracks = d.tracks.filter((t) => !t.missing);
-    if (tracks.length) m.playQueue(tracks, Math.min(start, tracks.length - 1));
+    if (tracks.length) m.playQueue(tracks, Math.min(start, tracks.length - 1), undefined, { loop: d.order === 'loop' });
   };
   const toggle = (id) => {
     setOpen(open === id ? null : id);
@@ -90,6 +90,7 @@ function PlaylistList({ tabs, onLogout }) {
                 <button className="pl-toggle" onClick={() => toggle(p.id)} aria-expanded={open === p.id}>
                   <Chevron />
                   <span className="fname">{p.name}</span>
+                  {p.order === 'loop' && <span className="loopmark" title="По кругу">🔁</span>}
                   <span className="count">{p.count}</span>
                 </button>
                 <button className="icon" title="Играть" aria-label="Играть" disabled={!p.count} onClick={() => playAll(p.id)}>▶</button>
@@ -140,6 +141,7 @@ function PlaylistEditor({ id }) {
   const [pl, setPl] = useState(null);
   const [name, setName] = useState('');
   const [tracks, setTracks] = useState([]);
+  const [playOrder, setPlayOrder] = useState('linear');
   const [tab, setTab] = useState('content');
   const [saveState, setSaveState] = useState('saved'); // saved | pending | saving | error
   const [err, setErr] = useState('');
@@ -147,7 +149,7 @@ function PlaylistEditor({ id }) {
 
   useEffect(() => {
     api(`/api/playlists/${id}`)
-      .then((p) => { setPl(p); setName(p.name); setTracks(p.tracks); loaded.current = true; })
+      .then((p) => { setPl(p); setName(p.name); setTracks(p.tracks); setPlayOrder(p.order || 'linear'); loaded.current = true; })
       .catch((e) => setErr(e.message === 'Not Found' ? 'Плейлист не найден' : e.message));
   }, [id]);
 
@@ -159,14 +161,14 @@ function PlaylistEditor({ id }) {
     const t = setTimeout(async () => {
       setSaveState('saving');
       try {
-        await send(`/api/playlists/${id}`, 'PUT', { name, tracks: tracks.map(({ missing, ...t }) => t) });
+        await send(`/api/playlists/${id}`, 'PUT', { name, order: playOrder, tracks: tracks.map(({ missing, ...t }) => t) });
         setSaveState('saved');
       } catch {
         setSaveState('error');
       }
     }, 600);
     return () => clearTimeout(t);
-  }, [name, tracks]);
+  }, [name, tracks, playOrder]);
 
   const selected = useMemo(() => new Set(tracks.map((t) => t.id)), [tracks]);
   const setInPlaylist = (list, on) =>
@@ -190,6 +192,13 @@ function PlaylistEditor({ id }) {
         <input className="pl-name" value={name} maxLength={100} onChange={(e) => setName(e.target.value)} aria-label="Название плейлиста" />
         <span className={'save ' + saveState}>{status}</span>
       </header>
+      <div className="playorder" role="radiogroup" aria-label="Порядок воспроизведения">
+        <span>Воспроизведение</span>
+        <button role="radio" aria-checked={playOrder === 'linear'} className={playOrder === 'linear' ? 'on' : ''} onClick={() => setPlayOrder('linear')}
+          title="Играть от начала до конца и остановиться">→ Линейно</button>
+        <button role="radio" aria-checked={playOrder === 'loop'} className={playOrder === 'loop' ? 'on' : ''} onClick={() => setPlayOrder('loop')}
+          title="После последнего трека начинать сначала">🔁 По кругу</button>
+      </div>
       <nav className="subtabs">
         <button className={tab === 'content' ? 'on' : ''} onClick={() => setTab('content')}>Состав <span className="count">{tracks.length}</span></button>
         <button className={tab === 'order' ? 'on' : ''} onClick={() => setTab('order')}>Порядок</button>

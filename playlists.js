@@ -27,9 +27,14 @@ function cleanTrack(t) {
   return out;
 }
 
+// play order: 'linear' — play to the end and stop; 'loop' — start over after the last track
+const ORDERS = ['linear', 'loop'];
+const orderOf = (o) => (o === 'loop' ? 'loop' : 'linear'); // files from before v1.4 have no order: linear
+
 const headerOf = (p) => ({
   id: p.id,
   name: p.name,
+  order: orderOf(p.order),
   created: p.created,
   updated: p.updated,
   count: p.tracks.length,
@@ -80,7 +85,7 @@ export function createPlaylistsRouter({ dataDir, trackPath }) {
         tracks.push(JSON.parse(l));
       } catch {} // a damaged line costs one track, not the playlist
     }
-    return { ...header, tracks };
+    return { ...header, order: orderOf(header.order), tracks };
   }
 
   // atomic: write a temp file, then rename over the old one
@@ -126,7 +131,7 @@ export function createPlaylistsRouter({ dataDir, trackPath }) {
       if (!f.endsWith('.jsonl') || !ID_RE.test(id)) continue;
       try {
         const h = await readHeader(path.join(DIR, f));
-        index.set(id, { ...h, id });
+        index.set(id, { ...h, id, order: orderOf(h.order) });
       } catch (e) {
         console.error(`playlists: skipping ${f}: ${e.message}`);
       }
@@ -169,7 +174,8 @@ export function createPlaylistsRouter({ dataDir, trackPath }) {
     if (badName(name)) return res.status(400).json({ error: 'Name is required (up to 100 characters)' });
     if (index.size >= MAX_PLAYLISTS) return res.status(400).json({ error: 'Too many playlists' });
     const now = new Date().toISOString();
-    const p = { id: crypto.randomUUID(), name: name.trim(), created: now, updated: now, tracks: validTracks(req.body?.tracks || []) || [] };
+    if (req.body?.order !== undefined && !ORDERS.includes(req.body.order)) return res.status(400).json({ error: 'order must be linear or loop' });
+    const p = { id: crypto.randomUUID(), name: name.trim(), order: orderOf(req.body?.order), created: now, updated: now, tracks: validTracks(req.body?.tracks || []) || [] };
     await serial(p.id, () => writePlaylist(p));
     res.status(201).json(p);
   });
@@ -194,8 +200,9 @@ export function createPlaylistsRouter({ dataDir, trackPath }) {
   });
 
   router.put('/:id', known, async (req, res) => {
-    const { name, tracks } = req.body || {};
+    const { name, tracks, order } = req.body || {};
     if (name !== undefined && badName(name)) return res.status(400).json({ error: 'Name is required (up to 100 characters)' });
+    if (order !== undefined && !ORDERS.includes(order)) return res.status(400).json({ error: 'order must be linear or loop' });
     const list = tracks === undefined ? undefined : validTracks(tracks);
     if (list === null) return res.status(400).json({ error: `tracks must be an array of up to ${MAX_TRACKS} tracks` });
     try {
@@ -203,6 +210,7 @@ export function createPlaylistsRouter({ dataDir, trackPath }) {
         const p = await readPlaylist(req.params.id);
         if (name !== undefined) p.name = name.trim();
         if (list !== undefined) p.tracks = list;
+        if (order !== undefined) p.order = order;
         p.updated = new Date().toISOString();
         return writePlaylist(p);
       });
