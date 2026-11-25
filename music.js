@@ -456,6 +456,15 @@ export function createMusicRouter({ root, cacheDir, cacheLimitMb = 2048, ecoBitr
     }
   });
 
-  getTree().then((t) => console.log(`music: ${t.length} folders in ${ROOT}`)).catch((e) => console.error('music scan failed:', e.message));
+  router.stats = () => ({ folders: tree.data ? tree.data.length : null });
+  router.ready = getTree()
+    .then((t) => {
+      console.log(`music: ${t.length} folders in ${ROOT}`);
+      return t.length;
+    })
+    .catch((e) => {
+      console.error('music scan failed:', e.message);
+      return null;
+    });
   return router;
 }
