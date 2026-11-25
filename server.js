@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { sendRange, decodeText } from './util.js';
 import { createMusicRouter } from './music.js';
 import { startCacheJanitor } from './cache.js';
-import { probe, plan, seekPoint, streamTranscode, shiftVtt, embeddedVtt } from './transcode.js';
+import { probe, plan, seekPoint, streamTranscode, transcodeStatus, shiftVtt, embeddedVtt } from './transcode.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -202,6 +202,9 @@ app.use('/api', (req, res, next) => {
 });
 
 app.get('/api/me', (req, res) => res.json({ ok: true, music: !!MUSIC_ROOT }));
+
+// live transcoding load, e.g. for monitoring
+app.get('/api/status', (req, res) => res.json({ transcodes: transcodeStatus() }));
 
 if (MUSIC_ROOT) {
   app.use(
