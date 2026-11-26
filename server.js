@@ -331,7 +331,8 @@ app.get('/api/subtitle-embedded/:id/:n', async (req, res) => {
   const n = Number(req.params.n);
   if (!file || !Number.isInteger(n) || n < 0) return res.sendStatus(404);
   try {
-    const vtt = await embeddedVtt(file, n, CACHE_DIR);
+    const info = await probe(file);
+    const vtt = await embeddedVtt(file, n, CACHE_DIR, info.subs.map((s) => s.index));
     res.type('text/vtt; charset=utf-8').send(shiftVtt(vtt, Number(req.query.offset) || 0));
   } catch (e) {
     console.error('subtitle extract failed:', e.message?.slice(0, 300));

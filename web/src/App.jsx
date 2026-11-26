@@ -254,8 +254,16 @@ const savePrefs = (patch) => {
 const pickByPref = (items, pref) => {
   if (!pref) return -1;
   let i = items.findIndex((x) => x.title && x.title === pref.title && x.lang === pref.lang);
+  // same language: prefer full subtitles over "forced" ones (those only cover signs and foreign lines)
+  if (i < 0 && pref.lang) i = items.findIndex((x) => x.lang === pref.lang && !x.forced);
   if (i < 0 && pref.lang) i = items.findIndex((x) => x.lang === pref.lang);
   return i;
+};
+const subLabel = (s) => {
+  const parts = [s.lang.toUpperCase(), s.title].filter(Boolean);
+  if (s.forced && !/forced|форс/i.test(s.title)) parts.push('Forced');
+  const text = parts.join(' · ') || `Дорожка ${s.index + 1}`;
+  return s.forced ? `${text} — только надписи` : text;
 };
 
 const seekPointOf = (id, t, a) => api(`/api/seekpoint/${id}?t=${t.toFixed(3)}&audio=${a}`);
@@ -270,6 +278,8 @@ function Player({ v, list }) {
   const [error, setError] = useState('');
   const [audio, setAudio] = useState(0);
   const [sub, setSub] = useState('off');
+  const [subState, setSubState] = useState(''); // '' | loading | ok:<cues> | error
+  const trackRef = useRef(null);
   const [offset, setOffset] = useState(0); // where the current ffmpeg stream starts
   const [ss, setSs] = useState(0); // exact ffmpeg seek position for that start
   const [nonce, setNonce] = useState(0); // forces a new request even for the same start
@@ -299,7 +309,7 @@ function Player({ v, list }) {
         setAudio(a);
         const subs = [
           ...v.subs.map((s) => ({ key: 'ext:' + s.id, lang: s.lang, title: s.label })),
-          ...i.subs.map((s) => ({ key: 'emb:' + s.index, lang: s.lang, title: s.title })),
+          ...i.subs.map((s) => ({ key: 'emb:' + s.index, lang: s.lang, title: s.title, forced: s.forced })),
         ];
         const si = prefs.sub === 'off' ? -1 : pickByPref(subs, prefs.sub);
         setSub(si >= 0 ? subs[si].key : 'off');
@@ -429,7 +439,7 @@ function Player({ v, list }) {
   };
   const subsList = info ? [
     ...v.subs.map((s) => ({ key: 'ext:' + s.id, lang: s.lang, title: s.label, label: s.label + ' (файл)' })),
-    ...info.subs.map((s) => ({ key: 'emb:' + s.index, lang: s.lang, title: s.title, label: [s.lang.toUpperCase(), s.title].filter(Boolean).join(' · ') || `Дорожка ${s.index + 1}` })),
+    ...info.subs.map((s) => ({ key: 'emb:' + s.index, lang: s.lang, title: s.title, forced: s.forced, label: subLabel(s) })),
   ] : [];
   const chooseSub = (key) => {
     setSub(key);
@@ -441,6 +451,20 @@ function Player({ v, list }) {
     : sub.startsWith('emb:')
       ? `/api/subtitle-embedded/${v.id}/${sub.slice(4)}?offset=${subOffset.toFixed(1)}`
       : null;
+
+  // subtitle loading state: extracting embedded subtitles from a big MKV takes a while on the first request
+  useEffect(() => {
+    const t = trackRef.current;
+    if (!subSrc || !t) { setSubState(''); return; }
+    setSubState('loading');
+    const onLoad = () => setSubState('ok:' + (t.track?.cues?.length ?? 0));
+    const onError = () => setSubState('error');
+    t.addEventListener('load', onLoad);
+    t.addEventListener('error', onError);
+    if (t.readyState === 2) onLoad(); // already loaded (cached)
+    return () => { t.removeEventListener('load', onLoad); t.removeEventListener('error', onError); };
+  }, [subSrc, src]);
+
 
   const togglePlay = () => { const el = ref.current; el.paused ? el.play() : el.pause(); };
   const fullscreen = () => {
@@ -481,7 +505,7 @@ function Player({ v, list }) {
             controls={!streamMode}
             onClick={streamMode ? togglePlay : undefined}
           >
-            {subSrc && <track key={subSrc} kind="subtitles" label="sub" srcLang="und" src={subSrc} default />}
+            {subSrc && <track key={subSrc} ref={trackRef} kind="subtitles" label="sub" srcLang="und" src={subSrc} default />}
           </video>
         )}
         {!info && !error && <p className="empty">Читаю файл…</p>}
@@ -513,6 +537,9 @@ function Player({ v, list }) {
                 <option value="off">Выкл</option>
                 {subsList.map((s) => <option key={s.key} value={s.key}>{s.label}</option>)}
               </select>
+              {subState === 'loading' && <small className="substate">загружаются…</small>}
+              {subState === 'error' && <small className="substate err">не загрузились</small>}
+              {subState.startsWith('ok:') && <small className="substate">{subState.slice(3)} реплик</small>}
             </label>
           )}
           <span className="mode">{MODE_LABEL[mode]}</span>
