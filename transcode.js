@@ -71,7 +71,14 @@ export async function probe(file) {
     })),
     // only text subtitles can become WebVTT; image subs (PGS/VobSub) are skipped
     subs: subs
-      .map((s, i) => ({ index: i, codec: s.codec_name, lang: s.tags?.language || '', title: s.tags?.title || '' }))
+      .map((s, i) => ({
+        index: i,
+        codec: s.codec_name,
+        lang: s.tags?.language || '',
+        title: s.tags?.title || '',
+        // "forced" tracks only cover foreign-language lines and signs: mostly empty
+        forced: !!s.disposition?.forced || /forced|форс/i.test(s.tags?.title || ''),
+      }))
       .filter((s) => TEXT_SUBS.has(s.codec)),
   };
   if (probeCache.size > 2000) probeCache.clear();
@@ -285,38 +292,41 @@ export function shiftVtt(vtt, offset) {
   return out.join('\n\n');
 }
 
-// Embedded subtitles are extracted once (whole file read) and cached on disk.
-const extracting = new Map();
+// Embedded subtitles: extracting one track means reading the whole file (gigabytes over USB), so on the first
+// request *all* text tracks of the file are extracted in one ffmpeg pass and cached on disk.
+const extracting = new Map(); // file key -> running job
 
-export async function embeddedVtt(file, subIdx, cacheDir) {
+export async function embeddedVtt(file, subIdx, cacheDir, textIdx = [subIdx]) {
   const st = await fsp.stat(file);
-  const key = crypto.createHash('sha1').update(`${file}:${st.mtimeMs}:${subIdx}`).digest('hex');
-  const out = path.join(cacheDir, 'subs', key + '.vtt');
+  const fileKey = `${file}:${st.mtimeMs}`;
+  const outOf = (i) => path.join(cacheDir, 'subs', crypto.createHash('sha1').update(`${fileKey}:${i}`).digest('hex') + '.vtt');
+  const out = outOf(subIdx);
   try {
     const text = await fsp.readFile(out, 'utf8');
     touch(out);
     return text;
   } catch {}
-  if (extracting.has(out)) return extracting.get(out);
 
-  const job = (async () => {
-    await fsp.mkdir(path.dirname(out), { recursive: true });
-    const tmp = out + '.tmp';
-    await new Promise((resolve, reject) => {
-      execFile(
-        FFMPEG,
-        ['-hide_banner', '-loglevel', 'error', '-nostdin', '-y', '-i', file, '-map', `0:s:${subIdx}`, '-f', 'webvtt', tmp],
-        { timeout: 5 * 60_000 },
-        (err) => (err ? reject(err) : resolve()),
-      );
-    });
-    await fsp.rename(tmp, out);
-    return fsp.readFile(out, 'utf8');
-  })();
-  extracting.set(out, job);
-  try {
-    return await job;
-  } finally {
-    extracting.delete(out);
+  if (!extracting.has(fileKey)) {
+    const job = (async () => {
+      await fsp.mkdir(path.join(cacheDir, 'subs'), { recursive: true });
+      const want = [...new Set([subIdx, ...textIdx])];
+      const missing = [];
+      for (const i of want) if (!(await fsp.access(outOf(i)).then(() => true, () => false))) missing.push(i);
+      const args = ['-hide_banner', '-loglevel', 'error', '-nostdin', '-y', '-i', file];
+      for (const i of missing) args.push('-map', `0:s:${i}`, '-f', 'webvtt', outOf(i) + '.tmp');
+      const t0 = Date.now();
+      await new Promise((resolve, reject) => {
+        execFile(FFMPEG, args, { timeout: 10 * 60_000 }, (err, _o, stderr) =>
+          err ? reject(new Error(String(stderr || err.message).slice(0, 300))) : resolve(),
+        );
+      });
+      for (const i of missing) await fsp.rename(outOf(i) + '.tmp', outOf(i)).catch(() => {});
+      console.log(`subtitles: extracted ${missing.length} track(s) from ${path.basename(file)} in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+    })();
+    extracting.set(fileKey, job);
+    job.finally(() => extracting.delete(fileKey)).catch(() => {});
   }
+  await extracting.get(fileKey);
+  return fsp.readFile(out, 'utf8');
 }

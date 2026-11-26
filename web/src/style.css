@@ -235,3 +235,6 @@ section h2 { font-size: 14px; color: var(--muted); font-weight: 600; margin: 12p
 .playorder button.on { border-color: var(--accent); color: var(--accent); }
 .loopmark { flex: none; font-size: 13px; }
 .mrow2 .loopmark { cursor: default; }
+
+.substate { font-size: 11px; color: var(--muted); }
+.substate.err { color: #e06c6c; }
